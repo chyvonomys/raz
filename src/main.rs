@@ -1628,7 +1628,44 @@ fn write_file(filename: &str, bs: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn read_file<T, F>(filename: &str, parser: F) -> Result<T, String>
+fn print_byte(b: u8, a: &Plus3DosTag) {
+    use Plus3DosTag::*;
+    match *a {
+        Magic => print!(" {}", format!("{:02X}", b).red().on_black()),
+        Checksum => print!(" {}", format!("{:02X}", b).bright_red().on_black()),
+        Basic(BasicTag::Keyword) => print!(" {}", format!("{:02X}", b).green().on_black()),
+        Basic(BasicTag::Number) => print!(" {}", format!("{:02X}", b).blue().on_black()),
+        Basic(BasicTag::VarHead) => print!(" {}", format!("{:02X}", b).yellow().on_black()),
+        Basic(BasicTag::VarTail) => print!(" {}", format!("{:02X}", b).yellow().on_black()),
+        Basic(BasicTag::LineNumber) => print!(" {}", format!("{:02X}", b).bright_black().on_black()),
+        Unknown | Basic(BasicTag::Unknown) => print!(" {:02X}", b),
+        Mismatch => print!(" {}", format!("{:02X}", b).bright_red()), // TODO:
+    }
+}
+
+fn print_annotated_split(ori: &[u8], buf: &AnnotatedBuf<Plus3DosTag>) {
+    let mut pos: usize = 0;
+    for (n, a) in buf.attrs.iter() {
+        for i in pos..pos+n {
+            if i % 16 == 0 {
+                print!("\n{:04X}: ", i);
+                for j in i..i+16 {
+                    if j < ori.len() {
+                        print_byte(ori[j], if j < buf.bytes.len() && ori[j] == buf.bytes[j] {&Plus3DosTag::Unknown} else {&Plus3DosTag::Mismatch});
+                    } else {
+                        print!("   ");
+                    }
+                }
+                print!("  -- ");
+            }
+            print_byte(buf.bytes[i], a);
+        }
+        pos += n;
+    }
+    println!("\n")
+}
+
+fn read_file<T, F>(filename: &str, parser: F) -> Result<(Vec<u8>, T), String>
 where
     F: Fn(&[u8]) -> nom::IResult<&[u8], T>,
     T: std::fmt::Debug,
@@ -1642,12 +1679,83 @@ where
         .and_then(|bs| {
             let res = nom::combinator::all_consuming(parser)(&bs);
             match res {
-                Ok((_, tap)) => Ok(tap),
+                Ok((_, tap)) => Ok((bs, tap)),
                 Err(nom::Err::Error((i, k))) => Err(format!("offset={}, input={:?}, kind={:?}",
                                                             i.as_ptr() as usize - bs.as_ptr() as usize, &i[0..10], k)),
                 x => Err(format!("{:?}", x)),
             }
         })
+}
+
+enum Plus3DosTag {
+    Mismatch, // TODO:
+    Unknown,
+    Magic,
+    Checksum,
+    Basic(BasicTag),
+}
+
+impl Default for Plus3DosTag {
+    fn default() -> Self {
+        Plus3DosTag::Unknown
+    }
+}
+
+impl From<BasicTag> for Plus3DosTag {
+    fn from(t: BasicTag) -> Self {
+        Plus3DosTag::Basic(t)
+    }
+}
+
+enum BasicTag {
+    Unknown,
+    Number,
+    LineNumber,
+    Keyword,
+    VarHead,
+    VarTail,
+}
+
+impl Default for BasicTag {
+    fn default() -> Self {
+        BasicTag::Unknown
+    }
+}
+
+struct AnnotatedBuf<A> {
+    bytes: Vec<u8>,
+    attrs: Vec<(usize, A)>,
+}
+
+impl<A: Default> AnnotatedBuf<A> {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            attrs: vec![(0, A::default())],
+        }
+    }
+    fn reset<B: Into<A>>(&mut self, attr: B) {
+        self.attrs.push((0, attr.into()));
+    }
+    fn append(&mut self, mut buf: AnnotatedBuf<A>) {
+        self.bytes.append(&mut buf.bytes);
+        self.attrs.append(&mut buf.attrs);
+    }
+    fn pad(&mut self, val: u8, count: usize) {
+        self.bytes.extend(std::iter::repeat(val).take(count));
+        self.attrs.last_mut().unwrap().0 += count;
+    }
+    fn push(&mut self, byte: u8) {
+        self.bytes.push(byte);
+        self.attrs.last_mut().unwrap().0 += 1;
+    }
+    fn extend_from_slice(&mut self, slice: &[u8]) {
+        self.bytes.extend_from_slice(slice);
+        self.attrs.last_mut().unwrap().0 += slice.len();
+    }
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 // https://www.worldofspectrum.org/ZXSpectrum128+3Manual/chapter8pt27.html
@@ -1716,10 +1824,10 @@ fn plus3dos_parse_content_header(i: &[u8]) -> nom::IResult<&[u8], ContentHeader>
     Ok( (i, ch) )
 }
 
-fn plus3dos_unparse_content_header(o: &mut Vec<u8>, header: &ContentHeader) -> Result<(), ContentError> {
+fn plus3dos_unparse_content_header(o: &mut AnnotatedBuf<Plus3DosTag>, header: &ContentHeader) -> Result<(), ContentError> {
     o.push(header.ctag());
     unparse_content_header(o, &header);
-    o.push(0);
+    o.push(0x00);
     Ok(())
 }
 
@@ -1756,29 +1864,31 @@ fn plus3dos_parse_file(i: &[u8]) -> nom::IResult<&[u8], Plus3DosFile> {
     Ok((i, Plus3DosFile{issue_number, version_number, header, content}))
 }
 
-fn plus3dos_unparse_file(o: &mut Vec<u8>, p3dos: &Plus3DosFile) -> Result<(), Plus3DosError> {
+fn plus3dos_unparse_file(o: &mut AnnotatedBuf<Plus3DosTag>, p3dos: &Plus3DosFile) -> Result<(), Plus3DosError> {
+    o.reset(Plus3DosTag::Magic);
     o.extend_from_slice(b"PLUS3DOS");
     o.push(0x1A);
     o.push(p3dos.issue_number);
     o.push(p3dos.version_number);
+    o.reset(Plus3DosTag::Unknown);
     let file_length: u32 = /* content length */ 0 + 128;
     o.extend_from_slice(&file_length.to_le_bytes());
     plus3dos_unparse_content_header(o, &p3dos.header);
-    o.extend(std::iter::repeat(0).take(104));
-    o.push(o[0..].iter().fold(0u8, |acc, x| acc.wrapping_add(*x)));
+    o.pad(0u8, 104);
+    o.push(o.bytes.iter().fold(0u8, |acc, x| acc.wrapping_add(*x)));
     let content_params = unparse_content(o, &p3dos.content);
     println!("stored: {:?}, calculated: {:?}", p3dos.header.content_params, content_params);
     content_params.map(|_| ()).map_err(|ce| Plus3DosError::Content(ce))
 }
 
-fn plus3dos_read(filename: &str) -> Result<Plus3DosFile, Plus3DosError> {
+fn plus3dos_read(filename: &str) -> Result<(Vec<u8>, Plus3DosFile), Plus3DosError> {
     read_file(filename, plus3dos_parse_file).map_err(|fe| Plus3DosError::File(fe))
 }
 
 fn plus3dos_save(filename: &str, p3dos: &Plus3DosFile) -> Result<(), Plus3DosError> {
-    let mut bs = Vec::new();
-    plus3dos_unparse_file(&mut bs, p3dos)?;
-    write_file(filename, &bs).map_err(|fe| Plus3DosError::File(fe))
+    let mut buf = AnnotatedBuf::new();
+    plus3dos_unparse_file(&mut buf, p3dos)?;
+    write_file(filename, &buf.bytes).map_err(|fe| Plus3DosError::File(fe))
 }
 
 fn parse_content_header(i: &[u8], ctag: u8) -> nom::IResult<&[u8], ContentHeader> {
@@ -1819,7 +1929,7 @@ fn tap_parse_content_header(i: &[u8]) -> nom::IResult<&[u8], ([u8; 10], ContentH
     Ok( (i, (name.try_into().unwrap(), ch)) )
 }
 
-fn unparse_content_header(o: &mut Vec<u8>, header: &ContentHeader) -> Result<(), ContentError> {
+fn unparse_content_header<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, header: &ContentHeader) -> Result<(), ContentError> {
     let dl = header.data_length.to_le_bytes();
     o.push(dl[0]);
     o.push(dl[1]);
@@ -1856,7 +1966,7 @@ fn unparse_content_header(o: &mut Vec<u8>, header: &ContentHeader) -> Result<(),
     Ok(())
 }
 
-fn tap_unparse_content_header(o: &mut Vec<u8>, filename: &[u8; 10], header: &ContentHeader) -> Result<(), ContentError> {
+fn tap_unparse_content_header(o: &mut AnnotatedBuf<BasicTag>, filename: &[u8; 10], header: &ContentHeader) -> Result<(), ContentError> {
 
     o.push(header.ctag());
     o.extend_from_slice(filename);
@@ -1866,12 +1976,12 @@ fn tap_unparse_content_header(o: &mut Vec<u8>, filename: &[u8; 10], header: &Con
 }
 
 fn tap_save(filename: &str, tap: &TapFile) -> Result<(), String> {
-    let mut bs = Vec::new();
-    tap_unparse_file(&mut bs, tap).map_err(|e| format!("{:?}", e))?;
-    write_file(filename, &bs)
+    let mut buf = AnnotatedBuf::new();
+    tap_unparse_file(&mut buf, tap).map_err(|e| format!("{:?}", e))?;
+    write_file(filename, &buf.bytes)
 }
 
-fn tap_read(filename: &str) -> Result<TapFile, String> {
+fn tap_read(filename: &str) -> Result<(Vec<u8>, TapFile), String> {
     read_file(filename, tap_parse_file)
 }
 
@@ -1915,8 +2025,8 @@ fn tap_parse_block_pair(i0: &[u8]) -> nom::IResult<&[u8], TapBlockPair> {
     Ok((i3, TapBlockPair{filename: filename.clone(), content, extrablocks}))
 }
 
-fn tap_unparse_block_pair(o: &mut Vec<u8>, tap: &TapBlockPair) -> Result<(), TapError> {
-    let mut content_block = Vec::new();
+fn tap_unparse_block_pair(o: &mut AnnotatedBuf<BasicTag>, tap: &TapBlockPair) -> Result<(), TapError> {
+    let mut content_block = AnnotatedBuf::new();
     content_block.push(0xFF);
     let content_params = unparse_content(&mut content_block, &tap.content).map_err(|ce| TapError::Content(ce))?;
     if content_block.len() - 1 > 0xFFFF {
@@ -1924,22 +2034,22 @@ fn tap_unparse_block_pair(o: &mut Vec<u8>, tap: &TapBlockPair) -> Result<(), Tap
     }
     let content_header = ContentHeader{data_length: (content_block.len() - 1) as u16, content_params};
 
-    let mut header_block = Vec::new();
+    let mut header_block = AnnotatedBuf::new();
     header_block.push(0x00);
     let filename: [u8; 10] = tap.filename.as_bytes().try_into().map_err(|_| TapError::InvalidFilename)?;
     tap_unparse_content_header(&mut header_block, &filename, &content_header).map_err(|ce| TapError::Content(ce))?;
     
-    tap_unparse_block_body(o, &header_block)?;
-    tap_unparse_block_body(o, &content_block)?;
+    tap_unparse_block_body(o, header_block)?;
+    tap_unparse_block_body(o, content_block)?;
 
     for eb in &tap.extrablocks {
-        let mut extra_block = Vec::new();
+        let mut extra_block = AnnotatedBuf::new();
         match eb {
             ExtraBlock(0xFF, Bytes(v)) => { extra_block.push(0xFF); extra_block.extend_from_slice(&v) },
             ExtraBlock(0x00, Bytes(v)) if v.len() > 0 && v[0] > 3 => { extra_block.push(0x00); extra_block.extend_from_slice(&v) },
             _ => return Err(TapError::InvalidExtraBlock),
         }
-        tap_unparse_block_body(o, &extra_block)?;
+        tap_unparse_block_body(o, extra_block)?;
     }
     Ok(())
 }
@@ -1964,16 +2074,16 @@ fn parse_block_body(i0: &[u8]) -> nom::IResult<&[u8], &[u8]> {
     Ok((i2, block))
 }
 
-fn tap_unparse_block_body(o: &mut Vec<u8>, body: &[u8]) -> Result<(), TapError> {
+fn tap_unparse_block_body(o: &mut AnnotatedBuf<BasicTag>, body: AnnotatedBuf<BasicTag>) -> Result<(), TapError> {
     if body.len() >= 0xFFFF {
         return Err(TapError::BlockBodyLength)
     }
-    let check = xor_check(body);
+    let check = xor_check(&body.bytes);
     let sz = body.len() + 1;
     let le = sz.to_le_bytes();
     o.push(le[0]);
     o.push(le[1]);
-    o.extend_from_slice(body);
+    o.append(body);
     o.push(check);
     Ok(())
 }
@@ -2012,9 +2122,10 @@ enum TapError {
 enum Plus3DosError {
     Content(ContentError),
     File(String),
+    OutputMismatch,
 }
 
-fn tap_unparse_file(o: &mut Vec<u8>, tap: &TapFile) -> Result<(), TapError> {
+fn tap_unparse_file(o: &mut AnnotatedBuf<BasicTag>, tap: &TapFile) -> Result<(), TapError> {
     for p in &tap.pairs {
         let () = tap_unparse_block_pair(o, p)?;
     }
@@ -2125,7 +2236,7 @@ fn parse_basic_token(i: &[u8]) -> nom::IResult<&[u8], BasicToken> {
     ))(i)
 }
 
-fn unparse_basic_token(o: &mut Vec<u8>, token: &BasicToken) -> Result<(), ContentError> {
+fn unparse_basic_token<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, token: &BasicToken) -> Result<(), ContentError> {
     match token {
         BasicToken::Arrow => o.push(0x5E),
         BasicToken::Pound => o.push(0x60),
@@ -2144,7 +2255,11 @@ fn unparse_basic_token(o: &mut Vec<u8>, token: &BasicToken) -> Result<(), Conten
         BasicToken::Keyword(kw) => {
             KEYWORDS.iter().enumerate()
                 .find(|(_, x)| *x == kw)
-                .map(|(i, _)| o.push(i as u8 + 0xA5))
+                .map(|(i, _)| {
+                    o.reset(BasicTag::Keyword);
+                    o.push(i as u8 + 0xA5);
+                    o.reset(BasicTag::Unknown);
+                })
                 .ok_or(ContentError::InvalidKeyword)?
         },
         BasicToken::Number(n) => { o.push(0x0E); unparse_basic_number(o, n)? },
@@ -2191,8 +2306,10 @@ fn parse_basic_line(i: &[u8]) -> nom::IResult<&[u8], BasicLine> {
     )(i)
 }
 
-fn unparse_basic_line(o: &mut Vec<u8>, line: &BasicLine) -> Result<(), ContentError> {
+fn unparse_basic_line<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, line: &BasicLine) -> Result<(), ContentError> {
+    o.reset(BasicTag::LineNumber);
     o.extend_from_slice(&line.line_number.to_be_bytes());
+    o.reset(BasicTag::Unknown);
     match line.malformed {
         Some(fake_len) => {
             o.extend_from_slice(&fake_len.to_le_bytes());
@@ -2209,8 +2326,8 @@ fn unparse_basic_line(o: &mut Vec<u8>, line: &BasicLine) -> Result<(), ContentEr
             }
             o.push(0x0D);
             let len: u16 = (o.len() - offset0).try_into().map_err(|_| ContentError::LineLength)?;
-            o[offset0 + 0] = len.to_le_bytes()[0];
-            o[offset0 + 1] = len.to_le_bytes()[1];
+            o.bytes[offset0 + 0] = len.to_le_bytes()[0];
+            o.bytes[offset0 + 1] = len.to_le_bytes()[1];
         },
     }
     Ok(())
@@ -2238,12 +2355,14 @@ fn parse_basic_number(i: &[u8]) -> nom::IResult<&[u8], BasicNumber> {
     )(i)
 }
 
-fn unparse_basic_number(o: &mut Vec<u8>, n: &BasicNumber) -> Result<(), ContentError> {
+fn unparse_basic_number<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, n: &BasicNumber) -> Result<(), ContentError> {
+    o.reset(BasicTag::Number);
     o.push(n.exponent);
     o.push(n.mantissa.0);
     o.push(n.mantissa.1);
     o.push(n.mantissa.2);
     o.push(n.mantissa.3);
+    o.reset(BasicTag::Unknown);
     Ok(())
 }
 
@@ -2254,9 +2373,11 @@ fn parse_basic_varhead(mask: u8, i: &[u8]) -> nom::IResult<&[u8], char> {
     ), |c| *c >= 'a' && *c <= 'z')(i)
 }
 
-fn unparse_basic_varhead(o: &mut Vec<u8>, mask: u8, letter: char) -> Result<(), ContentError> {
+fn unparse_basic_varhead<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, mask: u8, letter: char) -> Result<(), ContentError> {
     if letter >= 'a' && letter <= 'z' {
+        o.reset(BasicTag::VarHead);
         o.push((mask << 5) | letter as u8 - 0x60);
+        o.reset(BasicTag::Unknown);
         Ok(())
     } else {
         Err(ContentError::InvalidVar)
@@ -2277,7 +2398,8 @@ fn parse_basic_vartail(i: &[u8]) -> nom::IResult<&[u8], Vec<char>> {
     )(i)
 }
 
-fn unparse_basic_vartail(o: &mut Vec<u8>, tail: &[char]) -> Result<(), ContentError> {
+fn unparse_basic_vartail<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, tail: &[char]) -> Result<(), ContentError> {
+    o.reset(BasicTag::VarTail);
     for (i, c) in tail.iter().enumerate() {
         if isalphanum(*c) {
             let lastbit = if i + 1 == tail.len() { 0b1_0000000 } else { 0b0_0000000 };
@@ -2286,6 +2408,7 @@ fn unparse_basic_vartail(o: &mut Vec<u8>, tail: &[char]) -> Result<(), ContentEr
             return Err(ContentError::InvalidVar)
         }
     }
+    o.reset(BasicTag::Unknown);
     Ok(())
 }
 
@@ -2299,7 +2422,7 @@ where F: Fn(&'a[u8]) -> nom::IResult<&'a[u8], T>, T: std::fmt::Debug {
     Ok((i, (dims, values)))
 }
 
-fn unparse_basic_array<T, F>(o: &mut Vec<u8>, unparser: F, dims: &[u16], values: &[T]) -> Result<(), ContentError> {
+fn unparse_basic_array<A: Default, T, F>(o: &mut AnnotatedBuf<A>, unparser: F, dims: &[u16], values: &[T]) -> Result<(), ContentError> {
     if dims.len() <= 0xFF {
         o.push(dims.len() as u8);
     } else {
@@ -2366,7 +2489,7 @@ fn parse_basic_var(i: &[u8]) -> nom::IResult<&[u8], BasicVar> {
     ))(i)
 }
 
-fn unparse_basic_var(o: &mut Vec<u8>, var: &BasicVar) -> Result<(), ContentError> {
+fn unparse_basic_var<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, var: &BasicVar) -> Result<(), ContentError> {
     match var {
         BasicVar::Number{name, value} => {
             match name.chars().count() {
@@ -2390,7 +2513,12 @@ fn unparse_basic_var(o: &mut Vec<u8>, var: &BasicVar) -> Result<(), ContentError
             o.push(*stmt);
             Ok(())
         },
-        BasicVar::CharArray{letter, dims, values} => Err(ContentError::Todo("var char array")),
+        BasicVar::CharArray{letter, dims, values} => {
+            unparse_basic_varhead(o, 0b110, *letter)?;
+            o.push(77);
+            o.push(77);
+            unparse_basic_array(o, |o: &mut AnnotatedBuf<BasicTag>, x| o.push(x), dims, values)
+        },
         BasicVar::NumberArray{letter, dims, values} => Err(ContentError::Todo("var num array")),
         BasicVar::String{letter, text} => Err(ContentError::Todo("var string")),
     }
@@ -2431,7 +2559,7 @@ fn parse_content<'a>(params: &ContentParams, iso: &'a[u8]) -> nom::IResult<&'a[u
     }
 }
 
-fn unparse_content(o: &mut Vec<u8>, content: &Content) -> Result<ContentParams, ContentError> {
+fn unparse_content<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, content: &Content) -> Result<ContentParams, ContentError> {
     match content {
         Content::Program{autostart, lines, vars} => {
             let offset0 = o.len();
@@ -2457,11 +2585,11 @@ fn unparse_content(o: &mut Vec<u8>, content: &Content) -> Result<ContentParams, 
             Ok(ContentParams::Code {load_addr: *addr})
         },
         Content::NumberArray{name, dims, values} =>
-            unparse_basic_array(o, unparse_basic_number, dims, values).map(|()| {
+            unparse_basic_array(o, unparse_basic_number::<A>, dims, values).map(|()| {
                 ContentParams::NumberArray {name: *name}
             }),
         Content::CharacterArray{name, dims, values} =>
-            unparse_basic_array(o, |o: &mut Vec<u8>, x| o.push(x), dims, values).map(|()| {
+            unparse_basic_array(o, AnnotatedBuf::<A>::push, dims, values).map(|()| {
                 ContentParams::CharacterArray {name: *name}
             }),
     }
@@ -2507,9 +2635,18 @@ fn main() {
             }
         },
         (Some("+3dos"), Some(f)) => {
-            let res = plus3dos_read(&f).and_then(|p3dos| {
+            let res = plus3dos_read(&f).and_then(|(ori_bytes, p3dos)| {
                 println!("---------- +3DOS: {} ----------\n{:#?}", f, p3dos);
-                plus3dos_save(&format!("{}.out", f), &p3dos)
+                let mut buf = AnnotatedBuf::new();
+                let res = plus3dos_unparse_file(&mut buf, &p3dos);
+                print_annotated_split(&ori_bytes, &buf);
+                res.and_then(|res|
+                    if ori_bytes.len() == buf.len() {
+                        Ok(())
+                    } else {
+                        Err(Plus3DosError::OutputMismatch)
+                    }
+                )
             });
             println!("{}: {:?}", f, res);
         },
@@ -2521,7 +2658,7 @@ fn main() {
             //let test_taps = ["./Scene72.tap"];
             //let test_taps = ["./Ninjajar!_V1.1(128K)(en).tap"];
 
-            let res = tap_read(&f).and_then(|tap| {
+            let res = tap_read(&f).and_then(|(_, tap)| {
                 println!("---------- TAP: {} ----------\n{:#?}", f, tap);
                 tap_save(&format!("{}.out", f), &tap)
             });
