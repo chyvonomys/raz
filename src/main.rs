@@ -1628,41 +1628,80 @@ fn write_file(filename: &str, bs: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn print_byte(b: u8, a: &Plus3DosTag) {
-    use Plus3DosTag::*;
-    match *a {
-        Magic => print!(" {}", format!("{:02X}", b).red().on_black()),
-        Checksum => print!(" {}", format!("{:02X}", b).bright_red().on_black()),
-        Basic(BasicTag::Keyword) => print!(" {}", format!("{:02X}", b).green().on_black()),
-        Basic(BasicTag::Number) => print!(" {}", format!("{:02X}", b).blue().on_black()),
-        Basic(BasicTag::VarHead) => print!(" {}", format!("{:02X}", b).yellow().on_black()),
-        Basic(BasicTag::VarTail) => print!(" {}", format!("{:02X}", b).yellow().on_black()),
-        Basic(BasicTag::LineNumber) => print!(" {}", format!("{:02X}", b).bright_black().on_black()),
-        Unknown | Basic(BasicTag::Unknown) => print!(" {:02X}", b),
-        Mismatch => print!(" {}", format!("{:02X}", b).bright_red()), // TODO:
+trait Tag {
+    fn mismatch() -> Self;
+    fn print_byte(b: u8, a: &Self);
+}
+
+impl Tag for Plus3DosTag {
+    fn mismatch() -> Self {
+        Plus3DosTag::Mismatch
+    }
+    fn print_byte(b: u8, a: &Plus3DosTag) {
+        use Plus3DosTag::*;
+        match a {
+            Magic => print!(" {}", format!("{:02X}", b).red().on_black()),
+            Checksum => print!(" {}", format!("{:02X}", b).bright_red().on_black()),
+            Basic(bt) => print_byte(b, bt),
+            Unknown  => print!(" {:02X}", b),
+            Mismatch => print!(" {}", format!("{:02X}", b).bright_red()), // TODO:
+        }
     }
 }
 
-fn print_annotated_split(ori: &[u8], buf: &AnnotatedBuf<Plus3DosTag>) {
+fn print_byte(b: u8, a: &BasicTag) {
+    use BasicTag::*;
+    match *a {
+        Keyword => print!(" {}", format!("{:02X}", b).green().on_black()),
+        Number => print!(" {}", format!("{:02X}", b).blue().on_black()),
+        VarHead => print!(" {}", format!("{:02X}", b).yellow().on_black()),
+        VarTail => print!(" {}", format!("{:02X}", b).yellow().on_black()),
+        LineNumber => print!(" {}", format!("{:02X}", b).bright_black().on_black()),
+        Unknown => print!(" {:02X}", b),
+    }
+}
+
+impl Tag for TapTag {
+    fn mismatch() -> Self {
+        TapTag::Mismatch
+    }
+    fn print_byte(b: u8, a: &TapTag) {
+        use TapTag::*;
+        match a {
+            Basic(bt) => print_byte(b, bt),
+            Unknown => print!(" {:02X}", b),
+            Mismatch => print!(" {}", format!("{:02X}", b).bright_red()), // TODO:
+        }
+    }
+}
+
+fn print_annotated_split<A: Tag + Default>(ori: &[u8], buf: &AnnotatedBuf<A>) -> usize {
     let mut pos: usize = 0;
+    let mut mismatches: usize = 0;
     for (n, a) in buf.attrs.iter() {
         for i in pos..pos+n {
             if i % 16 == 0 {
                 print!("\n{:04X}: ", i);
                 for j in i..i+16 {
                     if j < ori.len() {
-                        print_byte(ori[j], if j < buf.bytes.len() && ori[j] == buf.bytes[j] {&Plus3DosTag::Unknown} else {&Plus3DosTag::Mismatch});
+                        if j < buf.bytes.len() && ori[j] == buf.bytes[j] {
+                            A::print_byte(ori[j], &A::default());
+                        } else {
+                            mismatches += 1;
+                            A::print_byte(ori[j], &A::mismatch());
+                        }
                     } else {
                         print!("   ");
                     }
                 }
                 print!("  -- ");
             }
-            print_byte(buf.bytes[i], a);
+            A::print_byte(buf.bytes[i], a);
         }
         pos += n;
     }
-    println!("\n")
+    println!("\n");
+    mismatches // NOTE: 0 mismatches if buf is ori + extra
 }
 
 fn read_file<T, F>(filename: &str, parser: F) -> Result<(Vec<u8>, T), String>
@@ -1687,9 +1726,27 @@ where
         })
 }
 
+enum TapTag {
+    Unknown, // TODO:
+    Basic(BasicTag),
+    Mismatch, // TODO:
+}
+
+impl Default for TapTag {
+    fn default() -> Self {
+        TapTag::Unknown
+    }
+}
+
+impl From<BasicTag> for TapTag {
+    fn from(t: BasicTag) -> Self {
+        TapTag::Basic(t)
+    }
+}
+
 enum Plus3DosTag {
     Mismatch, // TODO:
-    Unknown,
+    Unknown, // TODO:
     Magic,
     Checksum,
     Basic(BasicTag),
@@ -1752,6 +1809,9 @@ impl<A: Default> AnnotatedBuf<A> {
     fn extend_from_slice(&mut self, slice: &[u8]) {
         self.bytes.extend_from_slice(slice);
         self.attrs.last_mut().unwrap().0 += slice.len();
+    }
+    fn update_from_slice(&mut self, offset: usize, slice: &[u8]) {
+        self.bytes[offset..offset+slice.len()].copy_from_slice(slice);
     }
     fn len(&self) -> usize {
         self.bytes.len()
@@ -1841,7 +1901,7 @@ fn plus3dos_parse_file(i: &[u8]) -> nom::IResult<&[u8], Plus3DosFile> {
                         nom::bytes::complete::take(127usize),
                         nom::number::complete::be_u8,
                     )),
-                    |(bs, c)| *c == bs.iter().fold(0u8, |acc, x| acc.wrapping_add(*x))
+                    |(bs, c)| *c == bs.iter().fold(0x00, |acc, x| acc.wrapping_add(*x))
                 ),
                 |(bs, _)| bs
             ),
@@ -1871,12 +1931,17 @@ fn plus3dos_unparse_file(o: &mut AnnotatedBuf<Plus3DosTag>, p3dos: &Plus3DosFile
     o.push(p3dos.issue_number);
     o.push(p3dos.version_number);
     o.reset(Plus3DosTag::Unknown);
-    let file_length: u32 = /* content length */ 0 + 128;
-    o.extend_from_slice(&file_length.to_le_bytes());
+    let file_length_offset = o.len();
+    o.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // placeholder
     plus3dos_unparse_content_header(o, &p3dos.header);
-    o.pad(0u8, 104);
-    o.push(o.bytes.iter().fold(0u8, |acc, x| acc.wrapping_add(*x)));
+    o.pad(0x00, 104);
+    o.reset(Plus3DosTag::Checksum);
+    let checksum_offset = o.len();
+    o.push(0xFF); // placeholder
+    o.reset(Plus3DosTag::Unknown);
     let content_params = unparse_content(o, &p3dos.content);
+    o.update_from_slice(file_length_offset, &(o.len() as u32).to_le_bytes());
+    o.update_from_slice(checksum_offset, &[o.bytes[0..checksum_offset].iter().fold(0x00, |acc, x| acc.wrapping_add(*x))]);
     println!("stored: {:?}, calculated: {:?}", p3dos.header.content_params, content_params);
     content_params.map(|_| ()).map_err(|ce| Plus3DosError::Content(ce))
 }
@@ -1966,7 +2031,7 @@ fn unparse_content_header<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, 
     Ok(())
 }
 
-fn tap_unparse_content_header(o: &mut AnnotatedBuf<BasicTag>, filename: &[u8; 10], header: &ContentHeader) -> Result<(), ContentError> {
+fn tap_unparse_content_header(o: &mut AnnotatedBuf<TapTag>, filename: &[u8; 10], header: &ContentHeader) -> Result<(), ContentError> {
 
     o.push(header.ctag());
     o.extend_from_slice(filename);
@@ -1981,8 +2046,8 @@ fn tap_save(filename: &str, tap: &TapFile) -> Result<(), String> {
     write_file(filename, &buf.bytes)
 }
 
-fn tap_read(filename: &str) -> Result<(Vec<u8>, TapFile), String> {
-    read_file(filename, tap_parse_file)
+fn tap_read(filename: &str) -> Result<(Vec<u8>, TapFile), TapError> {
+    read_file(filename, tap_parse_file).map_err(|fe| TapError::File(fe))
 }
 
 fn tap_parse_block_pair(i0: &[u8]) -> nom::IResult<&[u8], TapBlockPair> {
@@ -2025,7 +2090,7 @@ fn tap_parse_block_pair(i0: &[u8]) -> nom::IResult<&[u8], TapBlockPair> {
     Ok((i3, TapBlockPair{filename: filename.clone(), content, extrablocks}))
 }
 
-fn tap_unparse_block_pair(o: &mut AnnotatedBuf<BasicTag>, tap: &TapBlockPair) -> Result<(), TapError> {
+fn tap_unparse_block_pair(o: &mut AnnotatedBuf<TapTag>, tap: &TapBlockPair) -> Result<(), TapError> {
     let mut content_block = AnnotatedBuf::new();
     content_block.push(0xFF);
     let content_params = unparse_content(&mut content_block, &tap.content).map_err(|ce| TapError::Content(ce))?;
@@ -2074,7 +2139,7 @@ fn parse_block_body(i0: &[u8]) -> nom::IResult<&[u8], &[u8]> {
     Ok((i2, block))
 }
 
-fn tap_unparse_block_body(o: &mut AnnotatedBuf<BasicTag>, body: AnnotatedBuf<BasicTag>) -> Result<(), TapError> {
+fn tap_unparse_block_body(o: &mut AnnotatedBuf<TapTag>, body: AnnotatedBuf<TapTag>) -> Result<(), TapError> {
     if body.len() >= 0xFFFF {
         return Err(TapError::BlockBodyLength)
     }
@@ -2101,6 +2166,7 @@ enum ContentError {
     ScreenSize,
     ArrayDimensions,
     LineLength,
+    StringLength,
     InvalidVar,
     InvalidKeyword,
     InvalidChar,
@@ -2112,20 +2178,22 @@ enum ContentError {
 #[derive(Debug)]
 enum TapError {
     Content(ContentError),
+    File(String),
     InvalidExtraBlock,
     InvalidFilename,
     BlockBodyLength,
     ContentBlockLength,
+    OutputMismatch(usize),
 }
 
 #[derive(Debug)]
 enum Plus3DosError {
     Content(ContentError),
     File(String),
-    OutputMismatch,
+    OutputMismatch(usize),
 }
 
-fn tap_unparse_file(o: &mut AnnotatedBuf<BasicTag>, tap: &TapFile) -> Result<(), TapError> {
+fn tap_unparse_file(o: &mut AnnotatedBuf<TapTag>, tap: &TapFile) -> Result<(), TapError> {
     for p in &tap.pairs {
         let () = tap_unparse_block_pair(o, p)?;
     }
@@ -2318,16 +2386,17 @@ fn unparse_basic_line<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, line
             }
         },
         None => {
-            let offset0 = o.len();
+            let len_offset = o.len();
             o.push(0xFF); // length placeholder
             o.push(0xFF);
+            let offset0 = o.len();
             for t in &line.tokens {
                 unparse_basic_token(o, &t)?;
             }
             o.push(0x0D);
             let len: u16 = (o.len() - offset0).try_into().map_err(|_| ContentError::LineLength)?;
-            o.bytes[offset0 + 0] = len.to_le_bytes()[0];
-            o.bytes[offset0 + 1] = len.to_le_bytes()[1];
+            o.bytes[len_offset + 0] = len.to_le_bytes()[0];
+            o.bytes[len_offset + 1] = len.to_le_bytes()[1];
         },
     }
     Ok(())
@@ -2422,11 +2491,15 @@ where F: Fn(&'a[u8]) -> nom::IResult<&'a[u8], T>, T: std::fmt::Debug {
     Ok((i, (dims, values)))
 }
 
-fn unparse_basic_array<A: Default, T, F>(o: &mut AnnotatedBuf<A>, unparser: F, dims: &[u16], values: &[T]) -> Result<(), ContentError> {
-    if dims.len() <= 0xFF {
-        o.push(dims.len() as u8);
-    } else {
-        return Err(ContentError::ArrayDimensions)
+fn unparse_basic_array<A: Default, T, F>(o: &mut AnnotatedBuf<A>, unparser: F, dims: &[u16], values: &[T]) -> Result<(), ContentError>
+where F: Fn(&mut AnnotatedBuf<A>, &T) -> Result<(), ContentError> {
+    if dims.len() > 0xFF { return Err(ContentError::ArrayDimensions) }
+    o.push(dims.len() as u8);
+    for d in dims {
+        o.extend_from_slice(&d.to_le_bytes());
+    }
+    for v in values {
+        unparser(o, v)?;
     }
 
     Ok(())
@@ -2515,12 +2588,23 @@ fn unparse_basic_var<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, var: 
         },
         BasicVar::CharArray{letter, dims, values} => {
             unparse_basic_varhead(o, 0b110, *letter)?;
-            o.push(77);
-            o.push(77);
-            unparse_basic_array(o, |o: &mut AnnotatedBuf<BasicTag>, x| o.push(x), dims, values)
+            o.push(0x77); // TODO:
+            o.push(0x77);
+            unparse_basic_array(o, |o, x| Ok(o.push(*x)), dims, values)
         },
-        BasicVar::NumberArray{letter, dims, values} => Err(ContentError::Todo("var num array")),
-        BasicVar::String{letter, text} => Err(ContentError::Todo("var string")),
+        BasicVar::NumberArray{letter, dims, values} => {
+            unparse_basic_varhead(o, 0b100, *letter)?;
+            o.push(0x88); // TODO:
+            o.push(0x88);
+            unparse_basic_array(o, unparse_basic_number::<A>, dims, values)
+        },
+        BasicVar::String{letter, text: Bytes(text)} => {
+            unparse_basic_varhead(o, 0b010, *letter)?;
+            if text.len() > 0xFFFF { return Err(ContentError::StringLength); }
+            o.extend_from_slice(&(text.len() as u16).to_le_bytes());
+            o.extend_from_slice(text);
+            Ok(())
+        },
     }
 }
 
@@ -2589,7 +2673,7 @@ fn unparse_content<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, content
                 ContentParams::NumberArray {name: *name}
             }),
         Content::CharacterArray{name, dims, values} =>
-            unparse_basic_array(o, AnnotatedBuf::<A>::push, dims, values).map(|()| {
+            unparse_basic_array(o, |o, x| Ok(o.push(*x)), dims, values).map(|()| {
                 ContentParams::CharacterArray {name: *name}
             }),
     }
@@ -2639,12 +2723,12 @@ fn main() {
                 println!("---------- +3DOS: {} ----------\n{:#?}", f, p3dos);
                 let mut buf = AnnotatedBuf::new();
                 let res = plus3dos_unparse_file(&mut buf, &p3dos);
-                print_annotated_split(&ori_bytes, &buf);
+                let mismatches = print_annotated_split(&ori_bytes, &buf);
                 res.and_then(|res|
-                    if ori_bytes.len() == buf.len() {
+                    if mismatches == 0 && ori_bytes.len() == buf.len() {
                         Ok(())
                     } else {
-                        Err(Plus3DosError::OutputMismatch)
+                        Err(Plus3DosError::OutputMismatch(mismatches))
                     }
                 )
             });
@@ -2652,15 +2736,18 @@ fn main() {
         },
         (Some("tap"), Some(f)) => {
 
-            //let test_taps = ["./coloristic.tap", "./Buzzsaw+(FoxtonLocksMix).tap", "automatedcaveexplorer48k.tap"];
-            //let test_taps = ["./Scene70.tap", "./Scene71.tap", "./Scene72.tap", "./Scene73.tap"];
-            //let test_taps = ["./bol.tap", "./snakescape.tap", "./GraviBots.tap", "./DreamWalker48.tap", "./SteppingStones.tap"];
-            //let test_taps = ["./Scene72.tap"];
-            //let test_taps = ["./Ninjajar!_V1.1(128K)(en).tap"];
-
-            let res = tap_read(&f).and_then(|(_, tap)| {
+            let res = tap_read(&f).and_then(|(ori_bytes, tap)| {
                 println!("---------- TAP: {} ----------\n{:#?}", f, tap);
-                tap_save(&format!("{}.out", f), &tap)
+                let mut buf = AnnotatedBuf::new();
+                let res = tap_unparse_file(&mut buf, &tap);
+                let mismatches = print_annotated_split(&ori_bytes, &buf);
+                res.and_then(|res|
+                    if mismatches == 0 && ori_bytes.len() == buf.len() {
+                        Ok(())
+                    } else {
+                        Err(TapError::OutputMismatch(mismatches))
+                    }
+                )
             });
             println!("{}: {:?}", f, res);
         }
