@@ -1620,6 +1620,7 @@ struct TapBlockPair {
     filename: String,
     content: Content,
     extrablocks: Vec<ExtraBlock>,
+    total_length: usize,
 }
 
 fn write_file(filename: &str, bs: &[u8]) -> Result<(), String> {
@@ -1657,6 +1658,7 @@ fn print_byte(b: u8, a: &BasicTag) {
         VarHead => print!(" {}", format!("{:02X}", b).yellow().on_black()),
         VarTail => print!(" {}", format!("{:02X}", b).yellow().on_black()),
         LineNumber => print!(" {}", format!("{:02X}", b).bright_black().on_black()),
+        DataLength => print!(" {}", format!("{:02X}", b).black().on_bright_black()),
         Unknown => print!(" {:02X}", b),
     }
 }
@@ -1671,6 +1673,7 @@ impl Tag for TapTag {
             Basic(bt) => print_byte(b, bt),
             Unknown => print!(" {:02X}", b),
             Mismatch => print!(" {}", format!("{:02X}", b).bright_red()), // TODO:
+            BlockStart => print!(" {}", format!("{:02X}", b).magenta().on_black()),
         }
     }
 }
@@ -1682,11 +1685,13 @@ fn print_annotated_split<A: Tag + Default>(ori: &[u8], buf: &AnnotatedBuf<A>) ->
         for i in pos..pos+n {
             if i % 16 == 0 {
                 print!("\n{:04X}: ", i);
+                let mut different = false;
                 for j in i..i+16 {
                     if j < ori.len() {
                         if j < buf.bytes.len() && ori[j] == buf.bytes[j] {
                             A::print_byte(ori[j], &A::default());
                         } else {
+                            different = true;
                             mismatches += 1;
                             A::print_byte(ori[j], &A::mismatch());
                         }
@@ -1694,7 +1699,7 @@ fn print_annotated_split<A: Tag + Default>(ori: &[u8], buf: &AnnotatedBuf<A>) ->
                         print!("   ");
                     }
                 }
-                print!("  -- ");
+                print!("  {} ", if different { "<>" } else { "==" });
             }
             A::print_byte(buf.bytes[i], a);
         }
@@ -1730,6 +1735,7 @@ enum TapTag {
     Unknown, // TODO:
     Basic(BasicTag),
     Mismatch, // TODO:
+    BlockStart,
 }
 
 impl Default for TapTag {
@@ -1766,6 +1772,7 @@ impl From<BasicTag> for Plus3DosTag {
 
 enum BasicTag {
     Unknown,
+    DataLength,
     Number,
     LineNumber,
     Keyword,
@@ -1825,7 +1832,8 @@ enum ContentParams {
     Program{autostart: Option<u16>, vars_offset: u16},
     NumberArray{name: char},
     CharacterArray{name: char},
-    Code{load_addr: u16},
+    Code{load_addr: u16, unused: u16},
+    Screen{unused: u16},
 }
 
 #[derive(Debug)]
@@ -1841,6 +1849,7 @@ impl ContentHeader {
             ContentParams::NumberArray{..} => 0x01,
             ContentParams::CharacterArray{..} => 0x02,
             ContentParams::Code{..} => 0x03,
+            ContentParams::Screen{..} => 0x03,
         }
     }
 }
@@ -1867,8 +1876,8 @@ impl std::fmt::Debug for Bytes {
 #[derive(Debug)]
 enum Content {
     Program{autostart: Option<u16>, lines: Vec<BasicLine>, vars: Vec<BasicVar>},
-    Code{data: Bytes, addr: u16},
-    Screen{bitmap: Bytes, attribs: Bytes}, // 256x192/8 bytes + 32x24 bytes @16384
+    Code{data: Bytes, addr: u16, unused: u16},
+    Screen{bitmap: Bytes, attribs: Bytes, unused: u16}, // 256x192/8 bytes + 32x24 bytes @16384
     NumberArray{name: char, dims: Vec<u16>, values: Vec<BasicNumber>},
     CharacterArray{name: char, dims: Vec<u16>, values: Vec<u8>},
 }
@@ -1974,13 +1983,22 @@ fn parse_content_header(i: &[u8], ctag: u8) -> nom::IResult<&[u8], ContentHeader
             )),
             |(_, name, _)| if ctag == 0x01 { ContentParams::NumberArray{name} } else { ContentParams::CharacterArray{name} }
         )(i)?,
-        0x03 => map(
-            tuple((
-                le_u16,
-                le_u16, //tag([0x00, 0x80])),
-            )),
-            |(load_addr, _)| ContentParams::Code{load_addr}
-        )(i)?,
+        0x03 => nom::combinator::cut(alt((
+            map(
+                tuple((
+                    verify(le_u16, |load_addr| *load_addr == 16384 && data_length == 6912),
+                    le_u16,//tag([0x00, 0x80]),
+                )),
+                |(_, unused)| ContentParams::Screen{unused}
+            ),
+            map(
+                tuple((
+                    le_u16,
+                    le_u16,//tag([0x00, 0x80]),
+                )),
+                |(load_addr, unused)| ContentParams::Code{load_addr, unused}
+            ),
+        )))(i)?,
         _ => panic!("ctag={}, data_length={}", ctag, data_length),
     };
     Ok( (i, ContentHeader{data_length, content_params}) )
@@ -1996,8 +2014,10 @@ fn tap_parse_content_header(i: &[u8]) -> nom::IResult<&[u8], ([u8; 10], ContentH
 
 fn unparse_content_header<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, header: &ContentHeader) -> Result<(), ContentError> {
     let dl = header.data_length.to_le_bytes();
+    o.reset(BasicTag::DataLength);
     o.push(dl[0]);
     o.push(dl[1]);
+    o.reset(BasicTag::Unknown);
 
     match header.content_params {
         ContentParams::Program{autostart, vars_offset} => {
@@ -2020,12 +2040,17 @@ fn unparse_content_header<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, 
             o.push(0xFF); // not used
             o.push(0xFF); // not used
         },
-        ContentParams::Code{load_addr} => {
+        ContentParams::Code{load_addr, unused} => {
             let la = load_addr.to_le_bytes();
             o.push(la[0]);
             o.push(la[1]);
-            o.push(0x00); // TODO:
-            o.push(0x80); // 
+            o.extend_from_slice(&unused.to_le_bytes()); // TODO:
+        },
+        ContentParams::Screen{unused} => {
+            let la = 16384u16.to_le_bytes();
+            o.push(la[0]);
+            o.push(la[1]);
+            o.extend_from_slice(&unused.to_le_bytes()); // TODO:
         },
     }
     Ok(())
@@ -2086,13 +2111,16 @@ fn tap_parse_block_pair(i0: &[u8]) -> nom::IResult<&[u8], TapBlockPair> {
             ))
         )
     )(i2)?;
-    
-    Ok((i3, TapBlockPair{filename: filename.clone(), content, extrablocks}))
+
+    let total_length = i0.len() - i3.len();
+    Ok((i3, TapBlockPair{filename: filename.clone(), content, extrablocks, total_length}))
 }
 
 fn tap_unparse_block_pair(o: &mut AnnotatedBuf<TapTag>, tap: &TapBlockPair) -> Result<(), TapError> {
     let mut content_block = AnnotatedBuf::new();
+    content_block.reset(TapTag::BlockStart);
     content_block.push(0xFF);
+    content_block.reset(TapTag::Unknown);
     let content_params = unparse_content(&mut content_block, &tap.content).map_err(|ce| TapError::Content(ce))?;
     if content_block.len() - 1 > 0xFFFF {
         return Err(TapError::ContentBlockLength);
@@ -2100,7 +2128,9 @@ fn tap_unparse_block_pair(o: &mut AnnotatedBuf<TapTag>, tap: &TapBlockPair) -> R
     let content_header = ContentHeader{data_length: (content_block.len() - 1) as u16, content_params};
 
     let mut header_block = AnnotatedBuf::new();
+    header_block.reset(TapTag::BlockStart);
     header_block.push(0x00);
+    header_block.reset(TapTag::Unknown);
     let filename: [u8; 10] = tap.filename.as_bytes().try_into().map_err(|_| TapError::InvalidFilename)?;
     tap_unparse_content_header(&mut header_block, &filename, &content_header).map_err(|ce| TapError::Content(ce))?;
     
@@ -2110,8 +2140,18 @@ fn tap_unparse_block_pair(o: &mut AnnotatedBuf<TapTag>, tap: &TapBlockPair) -> R
     for eb in &tap.extrablocks {
         let mut extra_block = AnnotatedBuf::new();
         match eb {
-            ExtraBlock(0xFF, Bytes(v)) => { extra_block.push(0xFF); extra_block.extend_from_slice(&v) },
-            ExtraBlock(0x00, Bytes(v)) if v.len() > 0 && v[0] > 3 => { extra_block.push(0x00); extra_block.extend_from_slice(&v) },
+            ExtraBlock(0xFF, Bytes(v)) => {
+                extra_block.reset(TapTag::BlockStart);
+                extra_block.push(0xFF);
+                extra_block.reset(TapTag::Unknown);
+                extra_block.extend_from_slice(&v)
+            },
+            ExtraBlock(0x00, Bytes(v)) if v.len() > 0 && v[0] > 3 => {
+                extra_block.reset(TapTag::BlockStart);
+                extra_block.push(0x00);
+                extra_block.reset(TapTag::Unknown);
+                extra_block.extend_from_slice(&v)
+            },
             _ => return Err(TapError::InvalidExtraBlock),
         }
         tap_unparse_block_body(o, extra_block)?;
@@ -2286,12 +2326,12 @@ fn parse_basic_token(i: &[u8]) -> nom::IResult<&[u8], BasicToken> {
         map(tag([0x5E]), |_| BasicToken::Arrow),
         map(tag([0x60]), |_| BasicToken::Pound),
         map(tag([0x7F]), |_| BasicToken::Copyright),
-        map(tag([0x0D]), |_| BasicToken::Return),
         map(verify(le_u8, |x| *x >= 0x20 && *x < 0x7F), |x| BasicToken::Ascii(x as char)),
         map(verify(le_u8, |x| *x >= 0x80 && *x < 0x90), |x| BasicToken::UdgBlock(x - 0x80)),
         map(verify(le_u8, |x| *x >= 0x90 && *x < 0xA5), |x| BasicToken::UdgLetter((b'A' + (x - 0x90)) as char)),
         map(verify(le_u8, |x| *x >= 0xA5), |x| BasicToken::Keyword(KEYWORDS[(x - 0xA5) as usize])),
         map(preceded(tag([0x0E]), parse_basic_number), BasicToken::Number),
+        map(tag([0x0D]), |_| BasicToken::Return),
         map(preceded(tag([0x10]), le_u8), |x| BasicToken::Ink(x)),
         map(preceded(tag([0x11]), le_u8), |x| BasicToken::Paper(x)),
         map(preceded(tag([0x12]), le_u8), |x| BasicToken::Flash(x)),
@@ -2309,11 +2349,11 @@ fn unparse_basic_token<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, tok
         BasicToken::Arrow => o.push(0x5E),
         BasicToken::Pound => o.push(0x60),
         BasicToken::Copyright => o.push(0x7F),
-        BasicToken::Return => o.push(0x0D),
         BasicToken::Ascii(x) => {
             // TODO: arrow/pound
             if *x >= ' ' && *x <= '~' { o.push(*x as u8) } else { return Err(ContentError::InvalidChar) }
         },
+
         BasicToken::UdgBlock(x) => {
             if *x < 0x10 { o.push(*x + 0x80) } else { return Err(ContentError::InvalidUdg) }
         },
@@ -2321,6 +2361,7 @@ fn unparse_basic_token<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, tok
             if *c >= 'A' && *c <= 'U' { o.push(*c as u8 - b'A' + 0x90) } else { return Err(ContentError::InvalidUdg) }
         },
         BasicToken::Keyword(kw) => {
+            // TODO: better lookup
             KEYWORDS.iter().enumerate()
                 .find(|(_, x)| *x == kw)
                 .map(|(i, _)| {
@@ -2331,6 +2372,7 @@ fn unparse_basic_token<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, tok
                 .ok_or(ContentError::InvalidKeyword)?
         },
         BasicToken::Number(n) => { o.push(0x0E); unparse_basic_number(o, n)? },
+        BasicToken::Return => o.push(0x0D),
         BasicToken::Ink(x) => { o.push(0x10); o.push(*x) },
         BasicToken::Paper(x) => { o.push(0x11); o.push(*x) },
         BasicToken::Flash(x) => { o.push(0x12); o.push(*x) },
@@ -2339,7 +2381,7 @@ fn unparse_basic_token<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, tok
         BasicToken::Over(x) => { o.push(0x15); o.push(*x) },
         BasicToken::At(y, x) => { o.push(0x16); o.push(*y); o.push(*x) },
         BasicToken::Tab(x) => { o.push(0x17); o.push(*x) },
-        BasicToken::Other(x) => { o.push(0x10); o.push(*x) },
+        BasicToken::Other(x) => o.push(*x),
     };
     Ok(())
 }
@@ -2402,10 +2444,15 @@ fn unparse_basic_line<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, line
     Ok(())
 }
 
-#[derive(Debug)]
 struct BasicNumber {
     exponent: u8,
     mantissa: (u8, u8, u8, u8),
+}
+
+impl std::fmt::Debug for BasicNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}_{},{},{},{}", self.exponent, self.mantissa.0, self.mantissa.1, self.mantissa.2, self.mantissa.3)
+    }
 }
 
 #[derive(Debug)]
@@ -2588,15 +2635,25 @@ fn unparse_basic_var<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, var: 
         },
         BasicVar::CharArray{letter, dims, values} => {
             unparse_basic_varhead(o, 0b110, *letter)?;
-            o.push(0x77); // TODO:
-            o.push(0x77);
-            unparse_basic_array(o, |o, x| Ok(o.push(*x)), dims, values)
+            let length_offset = o.len();
+            o.push(0xFF); // placeholder
+            o.push(0xFF);
+            let array_start = o.len();
+            let res = unparse_basic_array(o, |o, x| Ok(o.push(*x)), dims, values);
+            let array_length = o.len() - array_start;
+            o.bytes[length_offset..length_offset+2].copy_from_slice(&(array_length as u16).to_le_bytes());
+            res
         },
         BasicVar::NumberArray{letter, dims, values} => {
             unparse_basic_varhead(o, 0b100, *letter)?;
-            o.push(0x88); // TODO:
-            o.push(0x88);
-            unparse_basic_array(o, unparse_basic_number::<A>, dims, values)
+            let length_offset = o.len();
+            o.push(0xFF); // placeholder
+            o.push(0xFF);
+            let array_start = o.len();
+            let res = unparse_basic_array(o, unparse_basic_number::<A>, dims, values);
+            let array_length = o.len() - array_start;
+            o.bytes[length_offset..length_offset+2].copy_from_slice(&(array_length as u16).to_le_bytes());
+            res
         },
         BasicVar::String{letter, text: Bytes(text)} => {
             unparse_basic_varhead(o, 0b010, *letter)?;
@@ -2622,15 +2679,15 @@ fn parse_content<'a>(params: &ContentParams, iso: &'a[u8]) -> nom::IResult<&'a[u
                 ))),
                 |(lines, vars)| Content::Program {autostart: *autostart, lines, vars}
             )(iso),
-        ContentParams::Code {load_addr: 16384} if iso.len() == 6912 =>
+        ContentParams::Screen {unused} =>
             Ok((
                 &[],
-                Content::Screen{bitmap: Bytes(iso[0..256*192/8].to_vec()), attribs: Bytes(iso[256*192/8..].to_vec())}
+                Content::Screen{bitmap: Bytes(iso[0..256*192/8].to_vec()), attribs: Bytes(iso[256*192/8..].to_vec()), unused: *unused}
             )),
-        ContentParams::Code {load_addr} =>
+        ContentParams::Code {load_addr, unused} =>
             Ok((
                 &[],
-                Content::Code{addr: *load_addr, data: Bytes(iso.to_vec())}
+                Content::Code{addr: *load_addr, data: Bytes(iso.to_vec()), unused: *unused}
             )),
         ContentParams::NumberArray {name} => map(
             |i| parse_basic_array(parse_basic_number, i),
@@ -2656,17 +2713,17 @@ fn unparse_content<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, content
             }
             Ok(ContentParams::Program{autostart: *autostart, vars_offset})
         },
-        Content::Screen{bitmap: Bytes(xs), attribs: Bytes(ys)} => {
+        Content::Screen{bitmap: Bytes(xs), attribs: Bytes(ys), unused} => {
             if xs.len() != 256*192/8 || ys.len() != 768 {
                 return Err(ContentError::ScreenSize);
             }
             o.extend_from_slice(xs);
             o.extend_from_slice(ys);
-            Ok(ContentParams::Code {load_addr: 16384})
+            Ok(ContentParams::Screen{unused: *unused})
         },
-        Content::Code{addr, data: Bytes(xs)} => {
+        Content::Code{addr, data: Bytes(xs), unused} => {
             o.extend_from_slice(xs);
-            Ok(ContentParams::Code {load_addr: *addr})
+            Ok(ContentParams::Code {load_addr: *addr, unused: *unused})
         },
         Content::NumberArray{name, dims, values} =>
             unparse_basic_array(o, unparse_basic_number::<A>, dims, values).map(|()| {
@@ -2734,6 +2791,18 @@ fn main() {
             });
             println!("{}: {:?}", f, res);
         },
+        (Some("list-tap"), Some(f)) => {
+            let res = tap_read(&f).map(|(ori_bytes, tap)| {
+                println!("---------- TAP: {} ----------\n{:#?}", f, tap);
+                let mut cur_offset = 0;
+                for t in tap.pairs {
+                    println!("entry: `{}`, start: {}, length: {}", t.filename, cur_offset, t.total_length);
+                    cur_offset += t.total_length;
+                }
+                println!("file_length: {}, calculated: {}", ori_bytes.len(), cur_offset);
+            });
+            println!("{}: {:?}", f, res);
+        },
         (Some("tap"), Some(f)) => {
 
             let res = tap_read(&f).and_then(|(ori_bytes, tap)| {
@@ -2750,11 +2819,12 @@ fn main() {
                 )
             });
             println!("{}: {:?}", f, res);
-        }
+        },
         _ => {
             println!("invalid arguments");
             println!("`raz asm` -- assemble from stdin");
             println!("`raz +3dos <file>` -- parse +3DOS file");
+            println!("`raz list-tap <file>` -- list blocks of TAP file");
             println!("`raz tap <file>` -- parse TAP file");
         },
     }
