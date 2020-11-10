@@ -1461,8 +1461,8 @@ fn parse_byte_rv(i: &str) -> nom::IResult<&str, ByteRv> {
 
 fn parse_surrounded<'t, O, F>(
     b: &'t str, f: F, e: &'t str
-) -> impl Fn(&'t str) -> nom::IResult<&'t str, O>
-where F: Fn(&'t str) -> nom::IResult<&'t str, O>
+) -> impl FnMut(&'t str) -> nom::IResult<&'t str, O>
+where F: FnMut(&'t str) -> nom::IResult<&'t str, O>
 {
     map(
         tuple( (tag(b), space0, f, space0, tag(e)) ),
@@ -1472,9 +1472,9 @@ where F: Fn(&'t str) -> nom::IResult<&'t str, O>
 
 fn parse_unary_op<'t, O, A1, F1, MF>(
     t: &'t str, f1: F1, mf: MF
-) -> impl Fn(&'t str) -> nom::IResult<&'t str, O>
+) -> impl FnMut(&'t str) -> nom::IResult<&'t str, O>
 where
-    F1: Fn(&'t str) -> nom::IResult<&'t str, A1>,
+    F1: FnMut(&'t str) -> nom::IResult<&'t str, A1>,
     MF: Fn(A1) -> O,
 {
     map(
@@ -1485,10 +1485,10 @@ where
 
 fn parse_binary_op<'t, O, A1, A2, F1, F2, MF>(
     t: &'t str, f1: F1, f2: F2, mf: MF
-) -> impl Fn(&'t str) -> nom::IResult<&'t str, O>
+) -> impl FnMut(&'t str) -> nom::IResult<&'t str, O>
 where
-    F1: Fn(&'t str) -> nom::IResult<&'t str, A1>,
-    F2: Fn(&'t str) -> nom::IResult<&'t str, A2>,
+    F1: FnMut(&'t str) -> nom::IResult<&'t str, A1>,
+    F2: FnMut(&'t str) -> nom::IResult<&'t str, A2>,
     MF: Fn(A1, A2) -> O,
 {
     map(
@@ -1726,8 +1726,8 @@ where
             let res = nom::combinator::all_consuming(parser)(&bs);
             match res {
                 Ok((_, tap)) => Ok((bs, tap)),
-                Err(nom::Err::Error((i, k))) => Err(format!("offset={}, input={:?}, kind={:?}",
-                                                            i.as_ptr() as usize - bs.as_ptr() as usize, &i[0..10], k)),
+                //Err(nom::Err::Error((i, k))) => Err(format!("offset={}, input={:?}, kind={:?}",
+                //                                            i.as_ptr() as usize - bs.as_ptr() as usize, &i[0..10], k)),
                 x => Err(format!("{:?}", x)),
             }
         })
@@ -1915,13 +1915,13 @@ fn plus3dos_parse_file(i: &[u8]) -> nom::IResult<&[u8], Plus3DosFile> {
     let (i, (_, _, issue_number, version_number, data_length, header, _)) =
         map_parser(
             map(
-                verify(
+                cut(verify(
                     tuple((
                         nom::bytes::complete::take(127usize),
                         nom::number::complete::be_u8,
                     )),
-                    |(bs, c)| *c == bs.iter().fold(0x00, |acc, x| acc.wrapping_add(*x))
-                ),
+                    |t: &(&[u8], u8)| t.1 == t.0.iter().fold(0x00u8, |acc, x| acc.wrapping_add(*x))
+                )),
                 |(bs, _)| bs
             ),
             tuple((
