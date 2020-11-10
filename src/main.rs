@@ -2415,7 +2415,7 @@ fn parse_basic_line(i: &[u8]) -> nom::IResult<&[u8], BasicLine> {
     map(
         alt((
             map(
-                tuple((
+                nom::combinator::complete(nom::combinator::all_consuming(tuple((
                     map_parser(
                         nom::multi::length_data(
                             map(
@@ -2423,16 +2423,16 @@ fn parse_basic_line(i: &[u8]) -> nom::IResult<&[u8], BasicLine> {
                                 |total| total - 1
                             )
                         ),
-                        nom::multi::many0(parse_basic_token)
+                        nom::combinator::all_consuming(nom::multi::many0(parse_basic_token))
                     ),
                     tag([0x0D])
-                )),
+                )))),
                 |(tokens, _)| (None, tokens)
             ),
 
             // Parse malformed (which is actually ok in some cases, (see Ninjajar)
             // TODO: what if token (e.g number happens to be incomplete)
-            tuple((map(le_u16, Some), nom::multi::many0(parse_basic_token))),
+            tuple((map(le_u16, Some), nom::combinator::all_consuming(nom::multi::many0(parse_basic_token)))),
         )),
         move |(malformed, tokens)| BasicLine{line_number, malformed, tokens}
     )(i)
