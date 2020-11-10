@@ -1235,7 +1235,7 @@ impl<'t> Directive<'t> {
 
 use nom::bytes::complete::{tag, is_a, take_while1};
 use nom::branch::alt;
-use nom::combinator::{map, opt, value};
+use nom::combinator::{cut, map, map_parser, opt, value};
 use nom::character::complete::{space0, space1, digit1, hex_digit1, line_ending, not_line_ending};
 use nom::sequence::{preceded, tuple};
 use nom::AsChar;
@@ -1674,6 +1674,8 @@ impl Tag for TapTag {
             Unknown => print!(" {:02X}", b),
             Mismatch => print!(" {}", format!("{:02X}", b).bright_red()), // TODO:
             BlockStart => print!(" {}", format!("{:02X}", b).magenta().on_black()),
+            BlockBodyLength => print!(" {}", format!("{:02X}", b).cyan().on_black()),
+            Checksum => print!(" {}", format!("{:02X}", b).yellow().on_red()),
         }
     }
 }
@@ -1736,6 +1738,8 @@ enum TapTag {
     Basic(BasicTag),
     Mismatch, // TODO:
     BlockStart,
+    BlockBodyLength,
+    Checksum,
 }
 
 impl Default for TapTag {
@@ -1874,8 +1878,14 @@ impl std::fmt::Debug for Bytes {
 }
 
 #[derive(Debug)]
+enum VarsBlock {
+    Ok(Vec<BasicVar>),
+    Junk(Bytes),
+}
+
+#[derive(Debug)]
 enum Content {
-    Program{autostart: Option<u16>, lines: Vec<BasicLine>, vars: Vec<BasicVar>},
+    Program{autostart: Option<u16>, lines: Vec<BasicLine>, vars: VarsBlock},
     Code{data: Bytes, addr: u16, unused: u16},
     Screen{bitmap: Bytes, attribs: Bytes, unused: u16}, // 256x192/8 bytes + 32x24 bytes @16384
     NumberArray{name: char, dims: Vec<u16>, values: Vec<BasicNumber>},
@@ -1903,7 +1913,7 @@ fn plus3dos_unparse_content_header(o: &mut AnnotatedBuf<Plus3DosTag>, header: &C
 fn plus3dos_parse_file(i: &[u8]) -> nom::IResult<&[u8], Plus3DosFile> {
 
     let (i, (_, _, issue_number, version_number, data_length, header, _)) =
-        nom::combinator::map_parser(
+        map_parser(
             map(
                 verify(
                     tuple((
@@ -1925,7 +1935,7 @@ fn plus3dos_parse_file(i: &[u8]) -> nom::IResult<&[u8], Plus3DosFile> {
             ))
         )(i)?;
 
-    let (i, content) = nom::combinator::map_parser(
+    let (i, content) = map_parser(
         verify(nom::bytes::complete::take(data_length), |x: &[u8]| x.len() == header.data_length as usize),
         nom::combinator::all_consuming(|i| parse_content(&header.content_params, i))
     )(i)?;
@@ -1951,7 +1961,6 @@ fn plus3dos_unparse_file(o: &mut AnnotatedBuf<Plus3DosTag>, p3dos: &Plus3DosFile
     let content_params = unparse_content(o, &p3dos.content);
     o.update_from_slice(file_length_offset, &(o.len() as u32).to_le_bytes());
     o.update_from_slice(checksum_offset, &[o.bytes[0..checksum_offset].iter().fold(0x00, |acc, x| acc.wrapping_add(*x))]);
-    println!("stored: {:?}, calculated: {:?}", p3dos.header.content_params, content_params);
     content_params.map(|_| ()).map_err(|ce| Plus3DosError::Content(ce))
 }
 
@@ -1968,22 +1977,22 @@ fn plus3dos_save(filename: &str, p3dos: &Plus3DosFile) -> Result<(), Plus3DosErr
 fn parse_content_header(i: &[u8], ctag: u8) -> nom::IResult<&[u8], ContentHeader> {
     let (i, data_length) = le_u16(i)?;
     let (i, content_params) = match ctag {
-        0x00 => map(
+        0x00 => cut(map(
             tuple((
                 map(le_u16, |w| if w >= 0x8000 { None } else { Some(w) }),
                 le_u16,
             )),
             |(autostart, vars_offset)| ContentParams::Program{autostart, vars_offset}
-        )(i)?,
-        0x01 | 0x02 => map(
+        ))(i)?,
+        0x01 | 0x02 => cut(map(
             tuple((
                 le_u8,
                 |i| parse_basic_varhead(if ctag == 0x01 {0b100} else {0b110}, i),
                 le_u16
             )),
             |(_, name, _)| if ctag == 0x01 { ContentParams::NumberArray{name} } else { ContentParams::CharacterArray{name} }
-        )(i)?,
-        0x03 => nom::combinator::cut(alt((
+        ))(i)?,
+        0x03 => cut(alt((
             map(
                 tuple((
                     verify(le_u16, |load_addr| *load_addr == 16384 && data_length == 6912),
@@ -2076,7 +2085,7 @@ fn tap_read(filename: &str) -> Result<(Vec<u8>, TapFile), TapError> {
 }
 
 fn tap_parse_block_pair(i0: &[u8]) -> nom::IResult<&[u8], TapBlockPair> {
-    let (i1, (filename, content_header)) = nom::combinator::map_parser(
+    let (i1, (filename, content_header)) = map_parser(
         parse_block_body,
         map(
             preceded(
@@ -2087,11 +2096,11 @@ fn tap_parse_block_pair(i0: &[u8]) -> nom::IResult<&[u8], TapBlockPair> {
         )
     )(i0)?;
 
-    let (i2, content) = nom::combinator::map_parser(
+    let (i2, content) = map_parser(
         parse_block_body,
         preceded(
             tag([0xFF]),
-            nom::combinator::map_parser(
+            map_parser(
                 nom::bytes::complete::take(content_header.data_length),
                 move |i| parse_content(&content_header.content_params, i)
             )
@@ -2099,7 +2108,7 @@ fn tap_parse_block_pair(i0: &[u8]) -> nom::IResult<&[u8], TapBlockPair> {
     )(i1)?;
 
     let (i3, extrablocks) = nom::multi::many0(
-        nom::combinator::map_parser(
+        map_parser(
             parse_block_body,
             alt((
                 map(preceded(tag([0xFF]), nom::combinator::rest), |bs: &[u8]| ExtraBlock(0xFF, Bytes(bs.to_vec()))),
@@ -2107,7 +2116,9 @@ fn tap_parse_block_pair(i0: &[u8]) -> nom::IResult<&[u8], TapBlockPair> {
                 map(
                     preceded(tag([0x00]), tuple((verify(le_u8, |b| *b > 3), nom::combinator::rest))),
                     |(ctag, bs)| ExtraBlock(0x00, Bytes({let mut v = vec![ctag]; v.extend_from_slice(bs); v}))
-                )
+                ),
+                // possible 0xA6+.... block, see 'Pac-Man'
+                map(preceded(tag([0xA6]), nom::combinator::rest), |bs: &[u8]| ExtraBlock(0xA6, Bytes(bs.to_vec()))),
             ))
         )
     )(i2)?;
@@ -2152,6 +2163,13 @@ fn tap_unparse_block_pair(o: &mut AnnotatedBuf<TapTag>, tap: &TapBlockPair) -> R
                 extra_block.reset(TapTag::Unknown);
                 extra_block.extend_from_slice(&v)
             },
+            // Pac-Man
+            ExtraBlock(0xA6, Bytes(v)) => {
+                extra_block.reset(TapTag::BlockStart);
+                extra_block.push(0xA6);
+                extra_block.reset(TapTag::Unknown);
+                extra_block.extend_from_slice(&v)
+            },
             _ => return Err(TapError::InvalidExtraBlock),
         }
         tap_unparse_block_body(o, extra_block)?;
@@ -2165,16 +2183,16 @@ fn xor_check(x: &[u8]) -> u8 {
 
 fn parse_block_body(i0: &[u8]) -> nom::IResult<&[u8], &[u8]> {
     let (i1, block) = nom::multi::length_data(
-        nom::combinator::map(
+        map(
             verify(le_u16, |sz| *sz > 1),
             |total| total - 1
         )
     )(i0)?;
 
-    let (i2, _check) = verify(
+    let (i2, _check) = cut(verify(
         le_u8,
         |c| *c == xor_check(block)
-    )(i1)?;
+    ))(i1)?;
 
     Ok((i2, block))
 }
@@ -2186,15 +2204,19 @@ fn tap_unparse_block_body(o: &mut AnnotatedBuf<TapTag>, body: AnnotatedBuf<TapTa
     let check = xor_check(&body.bytes);
     let sz = body.len() + 1;
     let le = sz.to_le_bytes();
+    o.reset(TapTag::BlockBodyLength);
     o.push(le[0]);
     o.push(le[1]);
+    o.reset(TapTag::Unknown);
     o.append(body);
+    o.reset(TapTag::Checksum);
     o.push(check);
+    o.reset(TapTag::Unknown);
     Ok(())
 }
 
 fn tap_parse_file(i: &[u8]) -> nom::IResult<&[u8], TapFile> {
-    nom::combinator::map(
+    map(
         nom::multi::many0(tap_parse_block_pair),
         |pairs| TapFile {pairs}
     )(i)
@@ -2394,13 +2416,13 @@ fn parse_basic_line(i: &[u8]) -> nom::IResult<&[u8], BasicLine> {
         alt((
             map(
                 tuple((
-                    nom::combinator::map_parser(
-                        nom::combinator::complete(nom::multi::length_data(
-                            nom::combinator::map(
+                    map_parser(
+                        nom::multi::length_data(
+                            map(
                                 verify(le_u16, |sz| *sz >= 1),
                                 |total| total - 1
                             )
-                        )),
+                        ),
                         nom::multi::many0(parse_basic_token)
                     ),
                     tag([0x0D])
@@ -2669,16 +2691,23 @@ fn unparse_basic_var<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, var: 
 fn parse_content<'a>(params: &ContentParams, iso: &'a[u8]) -> nom::IResult<&'a[u8], Content> {
     match params {
         ContentParams::Program {autostart, vars_offset} =>
-            map(
-                nom::combinator::all_consuming(tuple((
-                    nom::combinator::map_parser(
+            cut(map(
+                tuple((
+                    map_parser(
                         nom::bytes::complete::take(*vars_offset),
-                        nom::multi::many0(parse_basic_line)
+                        nom::combinator::all_consuming(nom::multi::many0(parse_basic_line))
                     ),
-                    nom::multi::many0(parse_basic_var)
-                ))),
+                    alt((
+                        nom::combinator::all_consuming(map(
+                            nom::multi::many0(parse_basic_var), VarsBlock::Ok
+                        )),
+                        nom::combinator::all_consuming(map(
+                            nom::combinator::rest, |bs: &[u8]| VarsBlock::Junk(Bytes(bs.to_vec()))
+                        )),
+                    ))
+                )),
                 |(lines, vars)| Content::Program {autostart: *autostart, lines, vars}
-            )(iso),
+            ))(iso),
         ContentParams::Screen {unused} =>
             Ok((
                 &[],
@@ -2689,14 +2718,14 @@ fn parse_content<'a>(params: &ContentParams, iso: &'a[u8]) -> nom::IResult<&'a[u
                 &[],
                 Content::Code{addr: *load_addr, data: Bytes(iso.to_vec()), unused: *unused}
             )),
-        ContentParams::NumberArray {name} => map(
+        ContentParams::NumberArray {name} => cut(nom::combinator::all_consuming(map(
             |i| parse_basic_array(parse_basic_number, i),
             |(dims, values)| Content::NumberArray{name: *name, dims, values}
-        )(iso),
-        ContentParams::CharacterArray {name} => map(
+        )))(iso),
+        ContentParams::CharacterArray {name} => cut(nom::combinator::all_consuming(map(
             |i| parse_basic_array(le_u8, i),
             |(dims, values)| Content::CharacterArray{name: *name, dims, values}
-        )(iso),
+        )))(iso),
     }
 }
 
@@ -2708,8 +2737,9 @@ fn unparse_content<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, content
                 unparse_basic_line(o, l)?;
             }
             let vars_offset = (o.len() - offset0).try_into().map_err(|_| ContentError::ProgramLength)?;
-            for v in vars {
-                unparse_basic_var(o, v)?;
+            match vars {
+                VarsBlock::Ok(vs) => for v in vs { unparse_basic_var(o, v)?; },
+                VarsBlock::Junk(Bytes(bs)) => o.extend_from_slice(&bs),
             }
             Ok(ContentParams::Program{autostart: *autostart, vars_offset})
         },
