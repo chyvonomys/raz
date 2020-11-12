@@ -1620,7 +1620,7 @@ struct TapBlockPair {
     filename: String,
     content: Content,
     extrablocks: Vec<ExtraBlock>,
-    total_length: usize,
+    derived_total_length: usize,
 }
 
 fn write_file(filename: &str, bs: &[u8]) -> Result<(), String> {
@@ -1631,84 +1631,90 @@ fn write_file(filename: &str, bs: &[u8]) -> Result<(), String> {
 
 trait Tag {
     fn mismatch() -> Self;
-    fn print_byte(b: u8, a: &Self);
+    fn print_byte(o: &mut String, b: u8, a: &Self);
 }
+
+use std::fmt::Write as FmtWrite;
 
 impl Tag for Plus3DosTag {
     fn mismatch() -> Self {
         Plus3DosTag::Mismatch
     }
-    fn print_byte(b: u8, a: &Plus3DosTag) {
+    fn print_byte(o: &mut String, b: u8, a: &Plus3DosTag) {
         use Plus3DosTag::*;
+        use termion::color::*;
         match a {
-            Magic => print!(" {}", format!("{:02X}", b).red().on_black()),
-            Checksum => print!(" {}", format!("{:02X}", b).bright_red().on_black()),
-            Basic(bt) => print_byte(b, bt),
-            Unknown  => print!(" {:02X}", b),
-            Mismatch => print!(" {}", format!("{:02X}", b).bright_red()), // TODO:
-        }
+            Magic => write!(o, " {}{}{:02X}{}{}", Fg(Red), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
+            Checksum => write!(o, " {}{}{:02X}{}{}", Fg(LightRed), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
+            Basic(bt) => Ok(print_byte(o, b, bt)),
+            Unknown  => write!(o, " {:02X}", b),
+            Mismatch => write!(o, " {}{:02X}{}", Fg(LightRed), b, Reset.fg_str()), // TODO:
+        }.unwrap()
     }
 }
 
-fn print_byte(b: u8, a: &BasicTag) {
+fn print_byte(o: &mut String, b: u8, a: &BasicTag) {
     use BasicTag::*;
+    use termion::color::*;
     match *a {
-        Keyword => print!(" {}", format!("{:02X}", b).green().on_black()),
-        Number => print!(" {}", format!("{:02X}", b).blue().on_black()),
-        VarHead => print!(" {}", format!("{:02X}", b).yellow().on_black()),
-        VarTail => print!(" {}", format!("{:02X}", b).yellow().on_black()),
-        LineNumber => print!(" {}", format!("{:02X}", b).bright_black().on_black()),
-        DataLength => print!(" {}", format!("{:02X}", b).black().on_bright_black()),
-        Unknown => print!(" {:02X}", b),
-    }
+        Keyword => write!(o, " {}{}{:02X}{}{}", Fg(Green), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
+        Number => write!(o, " {}{}{:02X}{}{}", Fg(Blue), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
+        VarHead => write!(o, " {}{}{:02X}{}{}", Fg(Yellow), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
+        VarTail => write!(o, " {}{}{:02X}{}{}", Fg(Yellow), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
+        LineNumber => write!(o, " {}{}{:02X}{}{}", Fg(LightBlack), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
+        DataLength => write!(o, " {}{}{:02X}{}{}", Fg(Black), Bg(LightBlack), b, Reset.bg_str(), Reset.fg_str()),
+        Unknown => write!(o, " {:02X}", b),
+    }.unwrap()
 }
 
 impl Tag for TapTag {
     fn mismatch() -> Self {
         TapTag::Mismatch
     }
-    fn print_byte(b: u8, a: &TapTag) {
+    fn print_byte(o: &mut String, b: u8, a: &TapTag) {
         use TapTag::*;
+        use termion::color::*;
         match a {
-            Basic(bt) => print_byte(b, bt),
-            Unknown => print!(" {:02X}", b),
-            Mismatch => print!(" {}", format!("{:02X}", b).bright_red()), // TODO:
-            BlockStart => print!(" {}", format!("{:02X}", b).magenta().on_black()),
-            BlockBodyLength => print!(" {}", format!("{:02X}", b).cyan().on_black()),
-            Checksum => print!(" {}", format!("{:02X}", b).yellow().on_red()),
-        }
+            Basic(bt) => Ok(print_byte(o, b, bt)),
+            Unknown => write!(o, " {:02X}", b),
+            Mismatch => write!(o, " {}{:02X}{}", Fg(LightRed), b, Reset.fg_str()), // TODO:
+            BlockStart => write!(o, " {}{}{:02X}{}{}", Fg(Magenta), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
+            BlockBodyLength => write!(o, " {}{}{:02X}{}{}", Fg(Cyan), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
+            Checksum => write!(o, " {}{}{:02X}{}{}", Fg(Yellow), Bg(Red), b, Reset.bg_str(), Reset.fg_str()),
+        }.unwrap()
     }
 }
 
-fn print_annotated_split<A: Tag + Default>(ori: &[u8], buf: &AnnotatedBuf<A>) -> usize {
+fn print_annotated_split<A: Tag + Default>(ori: &[u8], buf: &AnnotatedBuf<A>) -> (usize, String) {
+    let mut o = String::new();
     let mut pos: usize = 0;
     let mut mismatches: usize = 0;
     for (n, a) in buf.attrs.iter() {
         for i in pos..pos+n {
             if i % 16 == 0 {
-                print!("\n{:04X}: ", i);
+                write!(&mut o, "\n{:04X}: ", i);
                 let mut different = false;
                 for j in i..i+16 {
                     if j < ori.len() {
                         if j < buf.bytes.len() && ori[j] == buf.bytes[j] {
-                            A::print_byte(ori[j], &A::default());
+                            A::print_byte(&mut o, ori[j], &A::default());
                         } else {
                             different = true;
                             mismatches += 1;
-                            A::print_byte(ori[j], &A::mismatch());
+                            A::print_byte(&mut o, ori[j], &A::mismatch());
                         }
                     } else {
-                        print!("   ");
+                        write!(&mut o, "   ");
                     }
                 }
-                print!("  {} ", if different { "<>" } else { "==" });
+                write!(&mut o, "  {} ", if different { "<>" } else { "==" });
             }
-            A::print_byte(buf.bytes[i], a);
+            A::print_byte(&mut o, buf.bytes[i], a);
         }
         pos += n;
     }
-    println!("\n");
-    mismatches // NOTE: 0 mismatches if buf is ori + extra
+    write!(&mut o, "\n");
+    (mismatches, o) // NOTE: 0 mismatches if buf is ori + extra
 }
 
 fn read_file<T, F>(filename: &str, parser: F) -> Result<(Vec<u8>, T), String>
@@ -1870,10 +1876,9 @@ struct Bytes(Vec<u8>);
 
 impl std::fmt::Debug for Bytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "<{} bytes, min={:?}, max={:?}>",
+        write!(f, "<{} bytes, min={:?}, max={:?}>",
             self.0.len(), self.0.iter().min(), self.0.iter().max()
-        ))
+        )
     }
 }
 
@@ -2123,8 +2128,8 @@ fn tap_parse_block_pair(i0: &[u8]) -> nom::IResult<&[u8], TapBlockPair> {
         )
     )(i2)?;
 
-    let total_length = i0.len() - i3.len();
-    Ok((i3, TapBlockPair{filename: filename.clone(), content, extrablocks, total_length}))
+    let derived_total_length = i0.len() - i3.len();
+    Ok((i3, TapBlockPair{filename: filename.clone(), content, extrablocks, derived_total_length}))
 }
 
 fn tap_unparse_block_pair(o: &mut AnnotatedBuf<TapTag>, tap: &TapBlockPair) -> Result<(), TapError> {
@@ -2245,14 +2250,14 @@ enum TapError {
     InvalidFilename,
     BlockBodyLength,
     ContentBlockLength,
-    OutputMismatch(usize),
+    OutputMismatch(usize, usize, usize),
 }
 
 #[derive(Debug)]
 enum Plus3DosError {
     Content(ContentError),
     File(String),
-    OutputMismatch(usize),
+    OutputMismatch(usize, usize, usize),
 }
 
 fn tap_unparse_file(o: &mut AnnotatedBuf<TapTag>, tap: &TapFile) -> Result<(), TapError> {
@@ -2270,13 +2275,18 @@ struct BasicLine {
 
 impl std::fmt::Debug for BasicLine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "{}{} {}",
+        write!(f, "{}{} ",
             self.line_number,
-            self.malformed.map(|_| "*").unwrap_or(" "),
-            self.tokens.iter().enumerate()
-                .fold(String::new(), |mut acc, (n, x)| {colorfmt_basic_token(n, &mut acc, x); acc})
-        ))
+            self.malformed.map(|_| '*').unwrap_or(' '),
+        )?;
+        let mut co = ColoredWrite {
+            write: f,
+            n: 0,
+        };
+        for (n, x) in self.tokens.iter().enumerate() {
+            colorfmt_basic_token(&mut co, x)?;
+        }
+        write!(f, "{}{}", Fg(Reset), Bg(Reset))
     }
 }
 
@@ -2312,34 +2322,63 @@ enum BasicToken {
     Other(u8),
 }
 
-use colored::Colorize;
-
-fn interleave(n: usize, s: &str, c: colored::Color) -> String {
-    (if n % 2 == 0 {s.color(c)} else {s.color(c).on_color(colored::Color::Black)}).to_string()
+struct ColoredWrite<'f, 'a> {
+    write: &'f mut std::fmt::Formatter<'a>,
+    n: usize,
 }
 
-fn colorfmt_basic_token(n: usize, o: &mut String, token: &BasicToken) {
-    use colored::Color::*;
+use termion::color::*;
+
+impl ColoredWrite<'_, '_> {
+    fn reset_fg(&mut self) -> std::fmt::Result {
+        self.write.write_str(Reset.fg_str())
+    }
+    fn reset_bg(&mut self) -> std::fmt::Result {
+        self.write.write_str(Reset.bg_str())
+    }
+    fn set_fg(&mut self, c: &dyn termion::color::Color) -> std::fmt::Result {
+        c.write_fg(&mut self.write)
+    }
+    fn set_bg(&mut self, c: &dyn termion::color::Color) -> std::fmt::Result {
+        c.write_bg(&mut self.write)
+    }
+    fn interleave_bg(&mut self, c: &dyn termion::color::Color) -> std::fmt::Result {
+        self.n += 1;
+        if self.n % 2 == 0 {
+            self.reset_bg()
+        } else {
+            self.set_bg(c)
+        }
+    }
+}
+
+impl std::fmt::Write for ColoredWrite<'_, '_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.write.write_str(s)
+    }
+}
+
+fn colorfmt_basic_token(co: &mut ColoredWrite, token: &BasicToken) -> std::fmt::Result {
     use BasicToken::*;
     match token {
-        Arrow => o.push_str("?"),
-        Pound => o.push_str("?"),
-        Ascii(c) => o.push(*c),
-        Copyright => o.push_str("?"),
-        UdgLetter(c) => o.push_str(&format!("{}", c).yellow().to_string()),
-        UdgBlock(b) => o.push_str(&interleave(n, &format!("{:04b}", b), BrightYellow)),
-        Keyword(s) => o.push_str(&interleave(n, s, BrightGreen)),
-        Number(n) => o.push_str(&format!("{:?}", n).blue().to_string()),
-        Return => o.push_str(&interleave(n, "RET", BrightRed)),
-        Ink(b) => o.push_str(&interleave(n, &format!("INK{}", b), BrightRed)),
-        Paper(b) => o.push_str(&interleave(n, &format!("PAPER{}", b), BrightRed)),
-        Flash(b) => o.push_str(&interleave(n, &format!("FLASH{}", b), BrightRed)),
-        Bright(b) => o.push_str(&interleave(n, &format!("BRIGHT{}", b), BrightRed)),
-        Inverse(b) => o.push_str(&interleave(n, &format!("INVERSE{}", b), BrightRed)),
-        Over(b) => o.push_str(&interleave(n, &format!("OVER{}", b), BrightRed)),
-        At(y, x) => o.push_str(&interleave(n, &format!("AT{},{}", y, x), BrightRed)),
-        Tab(b) => o.push_str(&interleave(n, &format!("TAB{}", b), BrightRed)),
-        Other(b) => o.push_str(&interleave(n, &format!("{:02X}", b), BrightBlue)),
+        Arrow =>        { co.reset_bg()?; co.set_fg(&Magenta)?; co.write_char('^')                         },
+        Pound =>        { co.reset_bg()?; co.set_fg(&Magenta)?; co.write_char('$')                         },
+        Ascii(c) =>     { co.reset_bg()?; co.reset_fg()?; co.write_char(*c)                                },
+        Copyright =>    { co.reset_bg()?; co.set_fg(&Magenta)?; co.write_char('c')                         },
+        UdgLetter(c) => { co.set_fg(&Yellow)?;      co.interleave_bg(&Black)?; co.write_char(*c)           },
+        Number(n) =>    { co.set_fg(&Blue)?;        co.reset_bg()?; write!(co, "{:?}", n)                  },
+        UdgBlock(b) =>  { co.set_fg(&LightYellow)?; co.interleave_bg(&Black)?; write!(co, "{:04b}", b)     },
+        Keyword(s) =>   { co.set_fg(&LightGreen)?;  co.interleave_bg(&Black)?; co.write_str(s)             },
+        Return =>       { co.set_fg(&LightRed)?;    co.interleave_bg(&Black)?; co.write_str("RET")         },
+        Ink(b) =>       { co.set_fg(&LightRed)?;    co.interleave_bg(&Black)?; write!(co, "INK{}", b)      },
+        Paper(b) =>     { co.set_fg(&LightRed)?;    co.interleave_bg(&Black)?; write!(co, "PAPER{}", b)    },
+        Flash(b) =>     { co.set_fg(&LightRed)?;    co.interleave_bg(&Black)?; write!(co, "FLASH{}", b)    },
+        Bright(b) =>    { co.set_fg(&LightRed)?;    co.interleave_bg(&Black)?; write!(co, "BRIGHT{}", b)   },
+        Inverse(b) =>   { co.set_fg(&LightRed)?;    co.interleave_bg(&Black)?; write!(co, "INVERSE{}", b)  },
+        Over(b) =>      { co.set_fg(&LightRed)?;    co.interleave_bg(&Black)?; write!(co, "OVER{}", b)     },
+        At(y, x) =>     { co.set_fg(&LightRed)?;    co.interleave_bg(&Black)?; write!(co, "AT{},{}", y, x) },
+        Tab(b) =>       { co.set_fg(&LightRed)?;    co.interleave_bg(&Black)?; write!(co, "TAB{}", b)      },
+        Other(b) =>     { co.set_fg(&LightBlue)?;   co.interleave_bg(&Black)?; write!(co, "{:02X}", b)     },
     }
 }
 
@@ -2408,14 +2447,13 @@ fn unparse_basic_token<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, tok
     Ok(())
 }
 
-// isolated lines
-fn parse_basic_line(i: &[u8]) -> nom::IResult<&[u8], BasicLine> {
-    let (i, line_number) = nom::number::complete::be_u16(i)?;
-
+// isolated lines, i0 is *all* lines up to vars
+fn parse_basic_line(i0: &[u8]) -> nom::IResult<&[u8], BasicLine> {
+    let (i, line_number) = nom::number::complete::be_u16(i0)?;
     map(
         alt((
             map(
-                nom::combinator::complete(nom::combinator::all_consuming(tuple((
+                nom::combinator::complete(tuple((
                     map_parser(
                         nom::multi::length_data(
                             map(
@@ -2426,7 +2464,7 @@ fn parse_basic_line(i: &[u8]) -> nom::IResult<&[u8], BasicLine> {
                         nom::combinator::all_consuming(nom::multi::many0(parse_basic_token))
                     ),
                     tag([0x0D])
-                )))),
+                ))),
                 |(tokens, _)| (None, tokens)
             ),
 
@@ -2810,12 +2848,13 @@ fn main() {
                 println!("---------- +3DOS: {} ----------\n{:#?}", f, p3dos);
                 let mut buf = AnnotatedBuf::new();
                 let res = plus3dos_unparse_file(&mut buf, &p3dos);
-                let mismatches = print_annotated_split(&ori_bytes, &buf);
+                let (mismatches, s) = print_annotated_split(&ori_bytes, &buf);
+                println!("{}", s);
                 res.and_then(|res|
                     if mismatches == 0 && ori_bytes.len() == buf.len() {
                         Ok(())
                     } else {
-                        Err(Plus3DosError::OutputMismatch(mismatches))
+                        Err(Plus3DosError::OutputMismatch(mismatches, ori_bytes.len(), buf.len()))
                     }
                 )
             });
@@ -2826,8 +2865,8 @@ fn main() {
                 println!("---------- TAP: {} ----------\n{:#?}", f, tap);
                 let mut cur_offset = 0;
                 for t in tap.pairs {
-                    println!("entry: `{}`, start: {}, length: {}", t.filename, cur_offset, t.total_length);
-                    cur_offset += t.total_length;
+                    println!("entry: `{}`, start: {}, length: {}", t.filename, cur_offset, t.derived_total_length);
+                    cur_offset += t.derived_total_length;
                 }
                 println!("file_length: {}, calculated: {}", ori_bytes.len(), cur_offset);
             });
@@ -2839,15 +2878,45 @@ fn main() {
                 println!("---------- TAP: {} ----------\n{:#?}", f, tap);
                 let mut buf = AnnotatedBuf::new();
                 let res = tap_unparse_file(&mut buf, &tap);
-                let mismatches = print_annotated_split(&ori_bytes, &buf);
+                let (mismatches, s) = print_annotated_split(&ori_bytes, &buf);
+                println!("{}", s);
                 res.and_then(|res|
                     if mismatches == 0 && ori_bytes.len() == buf.len() {
                         Ok(())
                     } else {
-                        Err(TapError::OutputMismatch(mismatches))
+                        Err(TapError::OutputMismatch(mismatches, ori_bytes.len(), buf.len()))
                     }
                 )
             });
+            println!("{}: {:?}", f, res);
+        },
+        (Some("bad-tap"), Some(f)) => {
+            let tap = TapFile {
+                pairs: vec![
+                    TapBlockPair {
+                        filename: "bla       ".to_owned(),
+                        content: Content::Program {
+                            autostart: None,
+                            lines: vec![
+                                BasicLine{
+                                    line_number: 2357,
+                                    malformed: None,
+                                    tokens: vec![
+                                        BasicToken::Keyword("REM"),
+                                        BasicToken::Number(BasicNumber{exponent: 0, mantissa: (0, 0, 0, 0)}),
+                                        BasicToken::At(23, 57),
+                                        //BasicToken::Other(0x0E), // start number
+                                    ]
+                                },
+                            ],
+                            vars: VarsBlock::Ok(vec![]),
+                        },
+                        extrablocks: vec![],
+                        derived_total_length: 0,
+                    }
+                ]
+            };
+            let res = tap_save(&f, &tap);
             println!("{}: {:?}", f, res);
         },
         _ => {
