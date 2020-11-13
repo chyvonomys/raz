@@ -1888,11 +1888,46 @@ enum VarsBlock {
     Junk(Bytes),
 }
 
+struct Screen {
+    bitmap: Bytes, // 256x192/8 bytes
+    attribs: Bytes, // 32x24 bytes
+}
+
+fn get_ink_color(a: u8) -> Rgb {
+    let bright = if (a & 0b01_000_000) == 0b01_000_000 { 1 } else { 0 };
+    let r = if (a & 0b00_000_010) == 0b00_000_010 { 127 } else { 0 };
+    let g = if (a & 0b00_000_100) == 0b00_000_100 { 127 } else { 0 };
+    let b = if (a & 0b00_000_001) == 0b00_000_001 { 127 } else { 0 };
+    Rgb(r << bright, g << bright, b << bright)
+}
+
+fn get_paper_color(a: u8) -> Rgb {
+    let bright = if (a & 0b01_000_000) == 0b01_000_000 { 1 } else { 0 };
+    let r = if (a & 0b00_010_000) == 0b00_010_000 { 127 } else { 0 };
+    let g = if (a & 0b00_100_000) == 0b00_100_000 { 127 } else { 0 };
+    let b = if (a & 0b00_001_000) == 0b00_001_000 { 127 } else { 0 };
+    Rgb(r << bright, g << bright, b << bright)
+}
+
+impl std::fmt::Debug for Screen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "\n")?;
+        for r in 0..24 {
+            for c in 0..32 {
+                let a = self.attribs.0[r*32 + c];
+                write!(f, "{}{}{}", Fg(get_ink_color(a)), Bg(get_paper_color(a)), if (a & 0b1_0000000) == 0b1_0000000 { "{}" } else { "[]" })?;
+            }
+            write!(f, "{}{}\n", Reset.fg_str(), Reset.bg_str())?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 enum Content {
     Program{autostart: Option<u16>, lines: Vec<BasicLine>, vars: VarsBlock},
     Code{data: Bytes, addr: u16, unused: u16},
-    Screen{bitmap: Bytes, attribs: Bytes, unused: u16}, // 256x192/8 bytes + 32x24 bytes @16384
+    Screen{screen: Screen, unused: u16},
     NumberArray{name: char, dims: Vec<u16>, values: Vec<BasicNumber>},
     CharacterArray{name: char, dims: Vec<u16>, values: Vec<u8>},
 }
@@ -2749,7 +2784,13 @@ fn parse_content<'a>(params: &ContentParams, iso: &'a[u8]) -> nom::IResult<&'a[u
         ContentParams::Screen {unused} =>
             Ok((
                 &[],
-                Content::Screen{bitmap: Bytes(iso[0..256*192/8].to_vec()), attribs: Bytes(iso[256*192/8..].to_vec()), unused: *unused}
+                Content::Screen {
+                    screen: Screen {
+                        bitmap: Bytes(iso[0..256*192/8].to_vec()),
+                        attribs: Bytes(iso[256*192/8..].to_vec()),
+                    },
+                    unused: *unused,
+                }
             )),
         ContentParams::Code {load_addr, unused} =>
             Ok((
@@ -2781,7 +2822,7 @@ fn unparse_content<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, content
             }
             Ok(ContentParams::Program{autostart: *autostart, vars_offset})
         },
-        Content::Screen{bitmap: Bytes(xs), attribs: Bytes(ys), unused} => {
+        Content::Screen{screen: Screen{bitmap: Bytes(xs), attribs: Bytes(ys)}, unused} => {
             if xs.len() != 256*192/8 || ys.len() != 768 {
                 return Err(ContentError::ScreenSize);
             }
