@@ -1530,7 +1530,7 @@ fn parse_line(i: &str) -> nom::IResult<&str, Option<Directive>> {
 fn parse(i: &str) -> nom::IResult<&str, Vec<Directive>> {
     nom::multi::fold_many0(
         parse_line,
-        Vec::new(),
+        || Vec::new(),
         |mut acc, opt_d| {
             if let Some(d) = opt_d {
                 acc.push(d);
@@ -1632,6 +1632,7 @@ fn write_file(filename: &str, bs: &[u8]) -> Result<(), String> {
 trait Tag {
     fn mismatch() -> Self;
     fn print_byte(o: &mut String, b: u8, a: &Self);
+    fn print_legend(o: &mut String);
 }
 
 use std::fmt::Write as FmtWrite;
@@ -1651,6 +1652,14 @@ impl Tag for Plus3DosTag {
             Mismatch => write!(o, " {}{:02X}{}", Fg(LightRed), b, Reset.fg_str()), // TODO:
         }.unwrap()
     }
+    fn print_legend(o: &mut String) {
+        write!(o, "\nLEGEND:");
+        write!(o, "\nmagic: "); Self::print_byte(o, 0x69, &Plus3DosTag::Magic);
+        write!(o, "\nchecksum: "); Self::print_byte(o, 0x69, &Plus3DosTag::Checksum);
+        print_basic_legend(o);
+        write!(o, "\nunknown: "); Self::print_byte(o, 0x69, &Plus3DosTag::Unknown);
+        write!(o, "\n");
+    }
 }
 
 fn print_byte(o: &mut String, b: u8, a: &BasicTag) {
@@ -1659,12 +1668,22 @@ fn print_byte(o: &mut String, b: u8, a: &BasicTag) {
     match *a {
         Keyword => write!(o, " {}{}{:02X}{}{}", Fg(Green), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
         Number => write!(o, " {}{}{:02X}{}{}", Fg(Blue), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
-        VarHead => write!(o, " {}{}{:02X}{}{}", Fg(Yellow), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
+        VarHead => write!(o, " {}{}{:02X}{}{}", Fg(LightYellow), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
         VarTail => write!(o, " {}{}{:02X}{}{}", Fg(Yellow), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
         LineNumber => write!(o, " {}{}{:02X}{}{}", Fg(LightBlack), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
         DataLength => write!(o, " {}{}{:02X}{}{}", Fg(Black), Bg(LightBlack), b, Reset.bg_str(), Reset.fg_str()),
-        Unknown => write!(o, " {:02X}", b),
+        Unknown => write!(o, " {}{:02X}{}", Fg(LightBlack), b, Reset.fg_str()),
     }.unwrap()
+}
+
+fn print_basic_legend(o: &mut String) {
+    write!(o, "\nbasic: keyword: "); print_byte(o, 0x69, &BasicTag::Keyword);
+    write!(o, "\nbasic: number: "); print_byte(o, 0x69, &BasicTag::Number);
+    write!(o, "\nbasic: var head: "); print_byte(o, 0x69, &BasicTag::VarHead);
+    write!(o, "\nbasic: var tail: "); print_byte(o, 0x69, &BasicTag::VarTail);
+    write!(o, "\nbasic: line number: "); print_byte(o, 0x69, &BasicTag::LineNumber);
+    write!(o, "\nbasic: data length: "); print_byte(o, 0x69, &BasicTag::DataLength);
+    write!(o, "\nbasic: unknown: "); print_byte(o, 0x69, &BasicTag::Unknown);
 }
 
 impl Tag for TapTag {
@@ -1677,11 +1696,24 @@ impl Tag for TapTag {
         match a {
             Basic(bt) => Ok(print_byte(o, b, bt)),
             Unknown => write!(o, " {:02X}", b),
-            Mismatch => write!(o, " {}{:02X}{}", Fg(LightRed), b, Reset.fg_str()), // TODO:
+            Mismatch => write!(o, " {}{:02X}{}", Fg(LightRed), b, Reset.fg_str()), // TODO: doesn't belog here?
             BlockStart => write!(o, " {}{}{:02X}{}{}", Fg(Magenta), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
             BlockBodyLength => write!(o, " {}{}{:02X}{}{}", Fg(Cyan), Bg(Black), b, Reset.bg_str(), Reset.fg_str()),
             Checksum => write!(o, " {}{}{:02X}{}{}", Fg(Yellow), Bg(Red), b, Reset.bg_str(), Reset.fg_str()),
+            ContentTag => write!(o, " {}{}{:02X}{}{}", Fg(Magenta), Bg(Red), b, Reset.bg_str(), Reset.fg_str()),
+            Filename => write!(o, " {}{:02X}{}", Fg(Yellow), b, Reset.fg_str()),
         }.unwrap()
+    }
+    fn print_legend(o: &mut String) {
+        write!(o, "\nLEGEND:");
+        print_basic_legend(o);
+        write!(o, "\nunknown: "); Self::print_byte(o, 0x69, &TapTag::Unknown);
+        write!(o, "\nblock start: "); Self::print_byte(o, 0x69, &TapTag::BlockStart);
+        write!(o, "\nblock body length: "); Self::print_byte(o, 0x69, &TapTag::BlockBodyLength);
+        write!(o, "\nchecksum: "); Self::print_byte(o, 0x69, &TapTag::Checksum);
+        write!(o, "\ncontent tag: "); Self::print_byte(o, 0x69, &TapTag::ContentTag);
+        write!(o, "\nfilename: "); Self::print_byte(o, 0x69, &TapTag::Filename);
+        write!(o, "\n");
     }
 }
 
@@ -1714,6 +1746,7 @@ fn print_annotated_split<A: Tag + Default>(ori: &[u8], buf: &AnnotatedBuf<A>) ->
         pos += n;
     }
     write!(&mut o, "\n");
+    A::print_legend(&mut o);
     (mismatches, o) // NOTE: 0 mismatches if buf is ori + extra
 }
 
@@ -1745,6 +1778,8 @@ enum TapTag {
     Mismatch, // TODO:
     BlockStart,
     BlockBodyLength,
+    ContentTag,
+    Filename,
     Checksum,
 }
 
@@ -1839,9 +1874,9 @@ impl<A: Default> AnnotatedBuf<A> {
 
 #[derive(Debug)]
 enum ContentParams {
-    Program{autostart: Option<u16>, vars_offset: u16},
-    NumberArray{name: char},
-    CharacterArray{name: char},
+    Program{autostart: Result<u16, u16>, vars_offset: u16},
+    NumberArray{unused1: u8, name: char, unused2: u16},
+    CharacterArray{unused1: u8, name: char, unused2: u16},
     Code{load_addr: u16, unused: u16},
     Screen{unused: u16},
 }
@@ -1893,20 +1928,56 @@ struct Screen {
     attribs: Bytes, // 32x24 bytes
 }
 
-fn get_ink_color(a: u8) -> Rgb {
-    let bright = if (a & 0b01_000_000) == 0b01_000_000 { 1 } else { 0 };
-    let r = if (a & 0b00_000_010) == 0b00_000_010 { 127 } else { 0 };
-    let g = if (a & 0b00_000_100) == 0b00_000_100 { 127 } else { 0 };
-    let b = if (a & 0b00_000_001) == 0b00_000_001 { 127 } else { 0 };
-    Rgb(r << bright, g << bright, b << bright)
+fn get_ink_color(a: u8) -> &'static str {
+    let bright = (a & 0b01_000_000) == 0b01_000_000;
+    let r = (a & 0b00_000_010) == 0b00_000_010;
+    let g = (a & 0b00_000_100) == 0b00_000_100;
+    let b = (a & 0b00_000_001) == 0b00_000_001;
+    match (bright, r, g, b) {
+        (false, false, false, false) => Black.fg_str(),
+        (false, false, false, true) => Blue.fg_str(),
+        (false, false, true, false) => Green.fg_str(),
+        (false, false, true, true) => Cyan.fg_str(),
+        (false, true, false, false) => Red.fg_str(),
+        (false, true, false, true) => Magenta.fg_str(),
+        (false, true, true, false) => Yellow.fg_str(),
+        (false, true, true, true) => White.fg_str(),
+
+        (true, false, false, false) => LightBlack.fg_str(),
+        (true, false, false, true) => LightBlue.fg_str(),
+        (true, false, true, false) => LightGreen.fg_str(),
+        (true, false, true, true) => LightCyan.fg_str(),
+        (true, true, false, false) => LightRed.fg_str(),
+        (true, true, false, true) => LightMagenta.fg_str(),
+        (true, true, true, false) => LightYellow.fg_str(),
+        (true, true, true, true) => LightWhite.fg_str(),
+    }
 }
 
-fn get_paper_color(a: u8) -> Rgb {
-    let bright = if (a & 0b01_000_000) == 0b01_000_000 { 1 } else { 0 };
-    let r = if (a & 0b00_010_000) == 0b00_010_000 { 127 } else { 0 };
-    let g = if (a & 0b00_100_000) == 0b00_100_000 { 127 } else { 0 };
-    let b = if (a & 0b00_001_000) == 0b00_001_000 { 127 } else { 0 };
-    Rgb(r << bright, g << bright, b << bright)
+fn get_paper_color(a: u8) -> &'static str {
+    let bright = (a & 0b01_000_000) == 0b01_000_000;
+    let r = (a & 0b00_010_000) == 0b00_010_000;
+    let g = (a & 0b00_100_000) == 0b00_100_000;
+    let b = (a & 0b00_001_000) == 0b00_001_000;
+    match (bright, r, g, b) {
+        (false, false, false, false) => Black.bg_str(),
+        (false, false, false, true) => Blue.bg_str(),
+        (false, false, true, false) => Green.bg_str(),
+        (false, false, true, true) => Cyan.bg_str(),
+        (false, true, false, false) => Red.bg_str(),
+        (false, true, false, true) => Magenta.bg_str(),
+        (false, true, true, false) => Yellow.bg_str(),
+        (false, true, true, true) => White.bg_str(),
+
+        (true, false, false, false) => LightBlack.bg_str(),
+        (true, false, false, true) => LightBlue.bg_str(),
+        (true, false, true, false) => LightGreen.bg_str(),
+        (true, false, true, true) => LightCyan.bg_str(),
+        (true, true, false, false) => LightRed.bg_str(),
+        (true, true, false, true) => LightMagenta.bg_str(),
+        (true, true, true, false) => LightYellow.bg_str(),
+        (true, true, true, true) => LightWhite.bg_str(),
+    }
 }
 
 impl std::fmt::Debug for Screen {
@@ -1915,7 +1986,7 @@ impl std::fmt::Debug for Screen {
         for r in 0..24 {
             for c in 0..32 {
                 let a = self.attribs.0[r*32 + c];
-                write!(f, "{}{}{}", Fg(get_ink_color(a)), Bg(get_paper_color(a)), if (a & 0b1_0000000) == 0b1_0000000 { "{}" } else { "[]" })?;
+                write!(f, "{}{}{}", get_ink_color(a), get_paper_color(a), if (a & 0b1_0000000) == 0b1_0000000 { "{}" } else { "[]" })?;
             }
             write!(f, "{}{}\n", Reset.fg_str(), Reset.bg_str())?;
         }
@@ -1925,11 +1996,11 @@ impl std::fmt::Debug for Screen {
 
 #[derive(Debug)]
 enum Content {
-    Program{autostart: Option<u16>, lines: Vec<BasicLine>, vars: VarsBlock},
+    Program{autostart: Result<u16, u16>, lines: Vec<BasicLine>, vars: VarsBlock},
     Code{data: Bytes, addr: u16, unused: u16},
     Screen{screen: Screen, unused: u16},
-    NumberArray{name: char, dims: Vec<u16>, values: Vec<BasicNumber>},
-    CharacterArray{name: char, dims: Vec<u16>, values: Vec<u8>},
+    NumberArray{name: char, dims: Vec<u16>, values: Vec<BasicNumber>, unused1: u8, unused2: u16},
+    CharacterArray{name: char, dims: Vec<u16>, values: Vec<u8>, unused1: u8, unused2: u16},
 }
 
 use std::convert::TryInto;
@@ -1943,9 +2014,9 @@ fn plus3dos_parse_content_header(i: &[u8]) -> nom::IResult<&[u8], ContentHeader>
     Ok( (i, ch) )
 }
 
-fn plus3dos_unparse_content_header(o: &mut AnnotatedBuf<Plus3DosTag>, header: &ContentHeader) -> Result<(), ContentError> {
+fn plus3dos_unparse_content_header(o: &mut AnnotatedBuf<Plus3DosTag>, header: &ContentHeader) -> Result<(), Plus3DosError> {
     o.push(header.ctag());
-    unparse_content_header(o, &header);
+    unparse_content_header(o, &header).map_err(|c| Plus3DosError::Content(c))?;
     o.push(0x00);
     Ok(())
 }
@@ -1992,7 +2063,7 @@ fn plus3dos_unparse_file(o: &mut AnnotatedBuf<Plus3DosTag>, p3dos: &Plus3DosFile
     o.reset(Plus3DosTag::Unknown);
     let file_length_offset = o.len();
     o.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // placeholder
-    plus3dos_unparse_content_header(o, &p3dos.header);
+    plus3dos_unparse_content_header(o, &p3dos.header)?;
     o.pad(0x00, 104);
     o.reset(Plus3DosTag::Checksum);
     let checksum_offset = o.len();
@@ -2019,7 +2090,7 @@ fn parse_content_header(i: &[u8], ctag: u8) -> nom::IResult<&[u8], ContentHeader
     let (i, content_params) = match ctag {
         0x00 => cut(map(
             tuple((
-                map(le_u16, |w| if w >= 0x8000 { None } else { Some(w) }),
+                map(le_u16, |w| if w >= 0x8000 { Err(w) } else { Ok(w) }),
                 le_u16,
             )),
             |(autostart, vars_offset)| ContentParams::Program{autostart, vars_offset}
@@ -2030,7 +2101,7 @@ fn parse_content_header(i: &[u8], ctag: u8) -> nom::IResult<&[u8], ContentHeader
                 |i| parse_basic_varhead(if ctag == 0x01 {0b100} else {0b110}, i),
                 le_u16
             )),
-            |(_, name, _)| if ctag == 0x01 { ContentParams::NumberArray{name} } else { ContentParams::CharacterArray{name} }
+            |(unused1, name, unused2)| if ctag == 0x01 { ContentParams::NumberArray{unused1, name, unused2} } else { ContentParams::CharacterArray{unused1, name, unused2} }
         ))(i)?,
         0x03 => cut(alt((
             map(
@@ -2070,24 +2141,25 @@ fn unparse_content_header<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, 
 
     match header.content_params {
         ContentParams::Program{autostart, vars_offset} => {
-            let ll = autostart.unwrap_or(0x8000).to_le_bytes();
+            let ll = match autostart {
+                Ok(w) => if w >= 0x8000 { return Err(ContentError::LineNumber) } else { w },
+                Err(w) => if w < 0x8000 { return Err(ContentError::LineNumber) } else { w },
+            }.to_le_bytes();
             o.push(ll[0]);
             o.push(ll[1]);
             let vo = vars_offset.to_le_bytes();
             o.push(vo[0]);
             o.push(vo[1]);
         },
-        ContentParams::NumberArray{name} => {
-            o.push(0xFF); // not used
+        ContentParams::NumberArray{unused1, name, unused2} => {
+            o.push(unused1);
             unparse_basic_varhead(o, 0b100, name)?;
-            o.push(0xFF); // not used
-            o.push(0xFF); // not used
+            o.extend_from_slice(&unused2.to_le_bytes()); // TODO:
         },
-        ContentParams::CharacterArray{name} => {
-            o.push(0xFF); // not used
+        ContentParams::CharacterArray{unused1, name, unused2} => {
+            o.push(unused1);
             unparse_basic_varhead(o, 0b110, name)?;
-            o.push(0xFF); // not used
-            o.push(0xFF); // not used
+            o.extend_from_slice(&unused2.to_le_bytes()); // TODO:
         },
         ContentParams::Code{load_addr, unused} => {
             let la = load_addr.to_le_bytes();
@@ -2105,13 +2177,14 @@ fn unparse_content_header<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, 
     Ok(())
 }
 
-fn tap_unparse_content_header(o: &mut AnnotatedBuf<TapTag>, filename: &[u8; 10], header: &ContentHeader) -> Result<(), ContentError> {
+fn tap_unparse_content_header(o: &mut AnnotatedBuf<TapTag>, filename: &[u8; 10], header: &ContentHeader) -> Result<(), TapError> {
 
+    o.reset(TapTag::ContentTag);
     o.push(header.ctag());
+    o.reset(TapTag::Filename);
     o.extend_from_slice(filename);
-    unparse_content_header(o, header);
-
-    Ok(())
+    o.reset(TapTag::Unknown);
+    unparse_content_header(o, header).map_err(|ce| TapError::Content(ce))
 }
 
 fn tap_save(filename: &str, tap: &TapFile) -> Result<(), String> {
@@ -2183,7 +2256,7 @@ fn tap_unparse_block_pair(o: &mut AnnotatedBuf<TapTag>, tap: &TapBlockPair) -> R
     header_block.push(0x00);
     header_block.reset(TapTag::Unknown);
     let filename: [u8; 10] = tap.filename.as_bytes().try_into().map_err(|_| TapError::InvalidFilename)?;
-    tap_unparse_content_header(&mut header_block, &filename, &content_header).map_err(|ce| TapError::Content(ce))?;
+    tap_unparse_content_header(&mut header_block, &filename, &content_header)?;
     
     tap_unparse_block_body(o, header_block)?;
     tap_unparse_block_body(o, content_block)?;
@@ -2268,6 +2341,7 @@ enum ContentError {
     ScreenSize,
     ArrayDimensions,
     LineLength,
+    LineNumber,
     StringLength,
     InvalidVar,
     InvalidKeyword,
@@ -2797,13 +2871,13 @@ fn parse_content<'a>(params: &ContentParams, iso: &'a[u8]) -> nom::IResult<&'a[u
                 &[],
                 Content::Code{addr: *load_addr, data: Bytes(iso.to_vec()), unused: *unused}
             )),
-        ContentParams::NumberArray {name} => cut(nom::combinator::all_consuming(map(
+        ContentParams::NumberArray {unused1, name, unused2} => cut(nom::combinator::all_consuming(map(
             |i| parse_basic_array(parse_basic_number, i),
-            |(dims, values)| Content::NumberArray{name: *name, dims, values}
+            |(dims, values)| Content::NumberArray{name: *name, dims, values, unused1: *unused1, unused2: *unused2}
         )))(iso),
-        ContentParams::CharacterArray {name} => cut(nom::combinator::all_consuming(map(
+        ContentParams::CharacterArray {unused1, name, unused2} => cut(nom::combinator::all_consuming(map(
             |i| parse_basic_array(le_u8, i),
-            |(dims, values)| Content::CharacterArray{name: *name, dims, values}
+            |(dims, values)| Content::CharacterArray{name: *name, dims, values, unused1: *unused1, unused2: *unused2}
         )))(iso),
     }
 }
@@ -2834,13 +2908,13 @@ fn unparse_content<A: Default + From<BasicTag>>(o: &mut AnnotatedBuf<A>, content
             o.extend_from_slice(xs);
             Ok(ContentParams::Code {load_addr: *addr, unused: *unused})
         },
-        Content::NumberArray{name, dims, values} =>
+        Content::NumberArray{name, dims, values, unused1, unused2} =>
             unparse_basic_array(o, unparse_basic_number::<A>, dims, values).map(|()| {
-                ContentParams::NumberArray {name: *name}
+                ContentParams::NumberArray {unused1: *unused1, name: *name, unused2: *unused2}
             }),
-        Content::CharacterArray{name, dims, values} =>
+        Content::CharacterArray{name, dims, values, unused1, unused2} =>
             unparse_basic_array(o, |o, x| Ok(o.push(*x)), dims, values).map(|()| {
-                ContentParams::CharacterArray {name: *name}
+                ContentParams::CharacterArray {unused1: *unused1, name: *name, unused2: *unused2}
             }),
     }
 }
@@ -2914,7 +2988,6 @@ fn main() {
             println!("{}: {:?}", f, res);
         },
         (Some("tap"), Some(f)) => {
-
             let res = tap_read(&f).and_then(|(ori_bytes, tap)| {
                 println!("---------- TAP: {} ----------\n{:#?}", f, tap);
                 let mut buf = AnnotatedBuf::new();
@@ -2937,7 +3010,7 @@ fn main() {
                     TapBlockPair {
                         filename: "bla       ".to_owned(),
                         content: Content::Program {
-                            autostart: None,
+                            autostart: Err(0x8000),
                             lines: vec![
                                 BasicLine{
                                     line_number: 2357,
